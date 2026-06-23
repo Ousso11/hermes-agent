@@ -1,0 +1,247 @@
+"""Compresr tool-output compression plugin for Hermes.
+
+Compresses large tool outputs (verbose ``grep``/``read_file``/``execute_code``
+dumps) *as they arrive*, on the ``transform_tool_result`` hook — before they
+bloat the context window — using Compresr's query-specific tool-output API. Every
+dropped span is rewritten into an ADDRESSABLE recovery reference so the agent can
+``read_file(offset, limit)``/``grep`` the cached original back. Lossless by
+recovery; never a query-blind truncator.
+
+This is the per-turn complement to ``plugins/context_engine/compresr`` (which
+compresses at compaction time). The two compose: this is a pre-filter that
+shrinks each output once, so compaction has less residual to summarize.
+
+Activation (opt-in, off by default):
+
+    # ~/.hermes/config.yaml
+    compresr:
+      tool_output_enabled: true
+
+    # ~/.hermes/.env
+    COMPRESR_API_KEY=cmp_...
+
+Config (env first, then a ``compresr:`` block in config.yaml):
+
+    COMPRESR_API_KEY                    (required) cmp_... key
+    COMPRESR_BASE_URL                   default https://api.compresr.ai/api
+    COMPRESR_TOOL_OUTPUT_ENABLED        "1" to enable (or compresr.tool_output_enabled)
+    COMPRESR_TOOL_OUTPUT_MODEL          default toc_latte_v2
+    COMPRESR_TOOL_OUTPUT_MIN_TOKENS     default 1500 (skip smaller outputs)
+    COMPRESR_TOOL_OUTPUT_TIMEOUT        default 30 (seconds)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from .client import CompresrToolOutputClient, DEFAULT_TOOL_OUTPUT_MODEL
+from .compress import compress_tool_output, count_tokens
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_BASE_URL = "https://api.compresr.ai/api"
+_DEFAULT_MIN_TOKENS = 1500
+_DEFAULT_TIMEOUT = 30
+_FALLBACK_QUERY = (
+    "Preserve the facts, paths, identifiers, errors, and results in this tool "
+    "output that are needed to continue the task."
+)
+# Args we mine, in priority order, to reconstruct the tool's intent as a query.
+_QUERY_ARG_KEYS = ("query", "pattern", "command", "q", "search", "regex", "url")
+_PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
+
+
+def _read_config_block() -> Dict[str, Any]:
+    """Best-effort read of the ``compresr:`` block from config.yaml. Never raises."""
+    home = os.environ.get("HERMES_HOME") or os.path.join(
+        os.path.expanduser("~"), ".hermes"
+    )
+    cfg_path = Path(home) / "config.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        import yaml
+
+        with open(cfg_path, encoding="utf-8-sig") as f:
+            data = yaml.safe_load(f) or {}
+        block = data.get("compresr", {})
+        return block if isinstance(block, dict) else {}
+    except Exception as e:  # pragma: no cover - config is optional
+        logger.debug("tool_output_compresr: could not read config block: %s", e)
+        return {}
+
+
+def _as_bool(v: Any) -> bool:
+    return str(v).lower() in ("1", "true", "yes", "on")
+
+
+class ToolOutputCompressor:
+    """Holds config + clients and implements the transform hook."""
+
+    def __init__(self) -> None:
+        cfg = _read_config_block()
+
+        def _opt(env_key: str, cfg_key: str, default: Any) -> Any:
+            val = os.environ.get(env_key)
+            if val is not None and val != "":
+                return val
+            if cfg_key in cfg and cfg[cfg_key] not in (None, ""):
+                return cfg[cfg_key]
+            return default
+
+        self.api_key = _opt("COMPRESR_API_KEY", "api_key", "")
+        self.base_url = str(
+            _opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)
+        ).rstrip("/")
+        self.enabled = _as_bool(
+            _opt("COMPRESR_TOOL_OUTPUT_ENABLED", "tool_output_enabled", "")
+        )
+        self.model = str(
+            _opt("COMPRESR_TOOL_OUTPUT_MODEL", "tool_output_model", DEFAULT_TOOL_OUTPUT_MODEL)
+        )
+        self.min_tokens = int(
+            _opt("COMPRESR_TOOL_OUTPUT_MIN_TOKENS", "tool_output_min_tokens", _DEFAULT_MIN_TOKENS)
+        )
+        self.timeout = int(
+            _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT)
+        )
+
+        self._client = CompresrToolOutputClient(
+            api_key=self.api_key, base_url=self.base_url, model=self.model, timeout=self.timeout
+        )
+        # Cumulative stats for /usage and benchmarking.
+        self.calls = 0
+        self.errors = 0
+        self.tokens_saved = 0
+        self._cooldown_until = 0.0
+
+    # -- helpers -----------------------------------------------------------
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.api_key)
+
+    @staticmethod
+    def _derive_query(tool_name: str, args: Any) -> str:
+        """Reconstruct the tool's intent as a Compresr query.
+
+        For search-class tools (grep/web_search) the args ARE an excellent query;
+        for read/exec tools they are a weaker but still useful proxy.
+        """
+        if isinstance(args, dict):
+            for k in _QUERY_ARG_KEYS:
+                v = args.get(k)
+                if isinstance(v, str) and v.strip():
+                    return f"{tool_name}: {v.strip()}"[:600]
+            for k in _PATH_ARG_KEYS:
+                v = args.get(k)
+                if isinstance(v, str) and v.strip():
+                    return f"Relevant content of {v.strip()} for the current task"[:600]
+        if tool_name:
+            return f"Relevant output of the {tool_name} call for the current task"
+        return _FALLBACK_QUERY
+
+    @staticmethod
+    def _cache_id(content: str) -> str:
+        # Hash the CONTENT (not the tool_call_id) so two different outputs can
+        # never collide onto one cache file; identical outputs safely dedupe.
+        return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+
+    # -- the hook ----------------------------------------------------------
+
+    def on_transform_tool_result(
+        self,
+        tool_name: str = "",
+        args: Any = None,
+        result: Any = None,
+        task_id: str = "",
+        tool_call_id: str = "",
+        status: str = "",
+        **_: Any,
+    ) -> Optional[str]:
+        """Return a compressed replacement string, or None to leave unchanged.
+
+        Fail-open: any error, cooldown, small output, or error-status result
+        returns None so the model sees the original.
+        """
+        if not self.active or not isinstance(result, str):
+            return None
+        if status and status not in ("", "ok", "success"):
+            return None  # don't mangle error results
+        if "[compresr:" in result:
+            return None  # already compressed — idempotent
+        if count_tokens(result) < self.min_tokens:
+            return None  # too small to be worth a round-trip
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            return None
+
+        query = self._derive_query(tool_name, args)
+        cache_id = self._cache_id(result)
+        try:
+            out, info = compress_tool_output(
+                query=query,
+                content=result,
+                tool_name=tool_name,
+                cache_id=cache_id,
+                client=self._client,
+                task_id=task_id,
+            )
+        except Exception as e:  # compress is already fail-open, but be defensive
+            self.errors += 1
+            self._cooldown_until = now + 30.0
+            logger.warning("tool_output_compresr: hook error (%s)", e)
+            return None
+
+        if info.get("error"):
+            self.errors += 1
+            self._cooldown_until = now + 30.0
+        if not info.get("called_api"):
+            return None  # API failed → leave the original output unchanged
+        if "[compresr:" not in out:
+            # No recovery reference was emitted (degenerate/unanchored output, or
+            # nothing was dropped) — never hand back silently-lossy text; fail open.
+            return None
+        saved = max(0, info.get("base_tokens", 0) - info.get("out_tokens", 0))
+        self.calls += 1
+        self.tokens_saved += saved
+        logger.info(
+            "tool_output_compresr: %s %d→%d tokens (saved %d, %d gaps, anchored=%s)",
+            tool_name,
+            info.get("base_tokens", 0),
+            info.get("out_tokens", 0),
+            saved,
+            info.get("gaps", 0),
+            info.get("anchored_ok"),
+        )
+        return out
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "plugin": "tool_output_compresr",
+            "active": self.active,
+            "model": self.model,
+            "min_tokens": self.min_tokens,
+            "calls": self.calls,
+            "errors": self.errors,
+            "tokens_saved": self.tokens_saved,
+        }
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point — called by the Hermes plugin loader."""
+    compressor = ToolOutputCompressor()
+    ctx.register_hook("transform_tool_result", compressor.on_transform_tool_result)
+    if not compressor.api_key:
+        logger.info(
+            "tool_output_compresr: loaded but COMPRESR_API_KEY is unset — inactive."
+        )
+    elif not compressor.enabled:
+        logger.info(
+            "tool_output_compresr: loaded but disabled — set compresr.tool_output_enabled: true."
+        )

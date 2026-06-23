@@ -1,0 +1,217 @@
+"""Tests for the tool_output_compresr plugin: recovery anchoring and the
+transform_tool_result hook gating/fail-open behavior.
+
+These cover the load-bearing claim — compression is lossless *by recovery*: the
+addressable references map back to the exact dropped original line ranges.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from plugins.tool_output_compresr import recover  # noqa: E402
+from plugins.tool_output_compresr import ToolOutputCompressor  # noqa: E402
+
+ORIGINAL = "\n".join(
+    [
+        "line0 alpha",
+        "line1 bravo",
+        "line2 charlie",
+        "line3 delta",
+        "line4 echo",
+        "line5 foxtrot",
+    ]
+)
+
+
+def _recover_gap(original, gap):
+    """Reconstruct the dropped span from the cached original, as the agent would
+    via read_file(offset=gap.start+1, limit=gap.count)."""
+    lines = original.split("\n")
+    return lines[gap.start : gap.end + 1]
+
+
+def test_anchor_roundtrip_with_marker():
+    compressed = "\n".join(
+        ["line0 alpha", "line1 bravo", "[2 lines removed]", "line4 echo", "line5 foxtrot"]
+    )
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/abc123", ORIGINAL, compressed
+    )
+    assert ok
+    assert len(gaps) == 1
+    g = gaps[0]
+    assert (g.start, g.end, g.count) == (2, 3, 2)
+    # The dropped span is exactly recoverable.
+    assert _recover_gap(ORIGINAL, g) == ["line2 charlie", "line3 delta"]
+    # The reference is addressable and offset is 1-indexed (start+1).
+    assert ".compresr/cache/abc123 L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+    assert "line4 echo" in rewritten  # kept content preserved verbatim
+
+
+def test_anchor_silent_drop_no_marker():
+    """Even with NO drop marker, anchoring infers the gap from the skip."""
+    compressed = "\n".join(["line0 alpha", "line1 bravo", "line4 echo", "line5 foxtrot"])
+    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id1", ORIGINAL, compressed)
+    assert ok
+    assert len(gaps) == 1
+    assert (gaps[0].start, gaps[0].end) == (2, 3)
+
+
+def test_anchor_tolerates_whitespace_drift():
+    """~6% whitespace reformatting by the compressor must not defeat anchoring."""
+    compressed = "\n".join(
+        ["line0   alpha", "line1\tbravo", "[tokens dropped]", "line4 echo", "line5 foxtrot"]
+    )
+    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id2", ORIGINAL, compressed)
+    assert ok
+    assert (gaps[0].start, gaps[0].end) == (2, 3)
+
+
+def test_trailing_gap():
+    compressed = "\n".join(["line0 alpha", "line1 bravo"])
+    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id3", ORIGINAL, compressed)
+    assert ok
+    assert gaps[-1].end == 5  # tail dropped after last anchor
+
+
+def test_fully_paraphrased_falls_back_to_whole_file():
+    compressed = "a totally rewritten summary with no verbatim lines [content truncated]"
+    rewritten, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id4", ORIGINAL, compressed)
+    assert not ok
+    assert gaps == [recover._whole_file_gap(ORIGINAL)]
+    assert ".compresr/cache/id4" in rewritten
+
+
+def test_long_line_span_kept_inline_not_dropped():
+    """A dropped span containing a line longer than the recovery read path can
+    return verbatim (~2000 chars) must be kept INLINE, not turned into an
+    unrecoverable reference — preserving lossless-by-recovery for long lines."""
+    long_line = "DATA " + "x" * (recover.MAX_RECOVERABLE_LINE_CHARS + 500)
+    lines = [f"line {i} anchor text" for i in range(20)]
+    lines[10] = long_line
+    original = "\n".join(lines)
+    compressed = "\n".join(lines[:9] + ["[4 lines removed]"] + lines[13:])
+    rewritten, gaps, ok = recover.rewrite_placeholders(".compresr/cache/ll", original, compressed)
+    assert long_line in rewritten           # kept verbatim, recoverable in-context
+    assert all(g.start > 12 or g.end < 9 for g in gaps)  # the long span isn't a gap
+
+
+def test_reference_uses_given_absolute_path():
+    """The reference embeds the path it is handed verbatim, so callers can pass an
+    ABSOLUTE (cd-proof) cache path and recovery survives a later ``cd``."""
+    compressed = "\n".join(
+        ["line0 alpha", "line1 bravo", "[2 lines removed]", "line4 echo", "line5 foxtrot"]
+    )
+    abs_path = "/work/sub/.compresr/cache/abc123"
+    rewritten, _, _ = recover.rewrite_placeholders(abs_path, ORIGINAL, compressed)
+    assert f"{abs_path} L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
+def test_reference_never_matches_drop_marker():
+    """Our own 'omitted' reference must not be re-detected as a drop marker."""
+    ref = recover.build_reference(".compresr/cache/x", recover.Gap(0, 4, 5))
+    assert recover._drop_marker_re.search(ref) is None
+
+
+def test_hook_skips_small_output():
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key = True, "cmp_test"
+    assert c.on_transform_tool_result(tool_name="grep", args={}, result="tiny") is None
+
+
+def test_hook_compresses_large_output(monkeypatch):
+    from plugins.tool_output_compresr import cache
+
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    # The cache write goes through Hermes's file-ops backend; capture it here so
+    # the test doesn't spin up a real environment.
+    stored = {}
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default": stored.update({cid: content}) or cache.relative_cache_path(cid),
+    )
+    # Mock the API: pretend it kept the first 2 lines and dropped the rest.
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: ("line0 alpha\nline1 bravo\n[4 lines removed]", {"tokens_saved": 4}),
+    )
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "line"}, result=ORIGINAL, tool_call_id="tc1"
+    )
+    assert out is not None
+    assert "[compresr:" in out
+    # The EXACT text the API compressed was persisted so the reference resolves.
+    cache_id = c._cache_id(ORIGINAL)
+    assert cache_id in stored
+
+
+def test_hook_failopen_on_api_error(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+
+    def _boom(**kw):
+        raise RuntimeError("HTTP 500")
+
+    monkeypatch.setattr(c._client, "compress", _boom)
+    # Fail-open → original content, called_api False → hook returns None.
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc2"
+    )
+    assert out is None
+
+
+def test_hook_failopen_on_cache_write_failure(monkeypatch):
+    """If persisting the original fails, references would dangle — so the hook
+    must fail open to the original output rather than emit them."""
+    from plugins.tool_output_compresr import cache
+
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(
+        cache, "store_original", lambda cid, content, task_id="default": None
+    )
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: ("line0 alpha\nline1 bravo\n[4 lines removed]", {"tokens_saved": 4}),
+    )
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc4"
+    )
+    assert out is None
+
+
+def test_hook_failopen_when_no_recovery_reference(monkeypatch):
+    """If compression ever yields output carrying no recovery reference (degenerate
+    / fully-paraphrased, no anchors, no marker), the hook must not hand back
+    silently-lossy text — it fails open to the original."""
+    from plugins.tool_output_compresr import cache
+
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(
+        cache,
+        "store_original",
+        lambda cid, content, task_id="default": cache.relative_cache_path(cid),
+    )
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: ("a totally rewritten summary with no verbatim lines", {"tokens_saved": 1}),
+    )
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc5"
+    )
+    assert out is None
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
