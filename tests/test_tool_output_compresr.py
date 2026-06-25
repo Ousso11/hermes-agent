@@ -117,6 +117,73 @@ def test_reference_never_matches_drop_marker():
     assert recover._drop_marker_re.search(ref) is None
 
 
+def test_ambiguous_repeated_anchor_fails_open():
+    """Repeated single-line anchors can point at the wrong span, so recovery
+    should fail open instead of emitting a confidently wrong line reference."""
+    original = "\n".join(
+        [
+            "start",
+            "repeat",
+            "first hidden payload",
+            "repeat",
+            "second hidden payload",
+            "end",
+        ]
+    )
+    compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/ambiguous", original, compressed
+    )
+    assert not ok
+    assert gaps == []
+    assert rewritten == original
+
+
+def test_anchor_accepts_repeated_line_that_is_unique_after_cursor():
+    original = "\n".join(["same", "keep", "same", "tail"])
+    compressed = "\n".join(["keep", "same", "tail"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/repeated-after-cursor", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(0, 0, 1)]
+    assert ".compresr/cache/repeated-after-cursor L0-0" in rewritten
+
+
+def test_strict_marker_fallback_handles_repeated_kept_lines():
+    original = "\n".join(
+        ["header", "repeat", "payload a", "payload b", "repeat", "footer"]
+    )
+    compressed = "\n".join(["header", "repeat", "[2 lines removed]", "repeat", "footer"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/repeated-strict", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
+    assert ".compresr/cache/repeated-strict L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
+def test_strict_marker_fallback_extends_bad_count_to_next_anchor():
+    original = "\n".join(
+        ["header", "repeat", "payload a", "payload b", "repeat", "footer"]
+    )
+    compressed = "\n".join(["header", "repeat", "[1 lines removed]", "repeat", "footer"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/bad-count", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
+    assert ".compresr/cache/bad-count L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
 def test_hook_skips_small_output():
     c = ToolOutputCompressor()
     c.enabled, c.api_key = True, "cmp_test"
