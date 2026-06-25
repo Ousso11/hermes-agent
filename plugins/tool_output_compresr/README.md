@@ -44,6 +44,14 @@ verbatim kept lines against the cached original (normalized, tolerant of ~6%
 whitespace drift), so it works for `[5 lines removed]`, `[54 tokens dropped]`,
 and even silent drops with no marker at all.
 
+## Data sent to Compresr
+
+When enabled, this plugin sends large tool outputs to the configured Compresr
+API endpoint before those outputs enter the conversation context. Those outputs
+can include file contents, command output, logs, and other data returned by
+Hermes tools. Do not enable per-turn tool-output compression unless that
+third-party processing is acceptable for your deployment.
+
 ## Relationship to `context_engine/compresr`
 
 This is the **per-turn** complement to the **compaction-time**
@@ -68,12 +76,20 @@ Or run `hermes setup` and choose **Compresr** for the compression engine.
 
 | env / `compresr:` key | default | meaning |
 |---|---|---|
-| `COMPRESR_API_KEY` / `api_key` | — | **required** `cmp_…` key |
+| `COMPRESR_API_KEY` | — | **required** `cmp_…` key, read from `.env` only |
 | `COMPRESR_BASE_URL` / `base_url` | `https://api.compresr.ai/api` | API base |
 | `COMPRESR_TOOL_OUTPUT_ENABLED` / `tool_output_enabled` | `false` | master switch |
 | `COMPRESR_TOOL_OUTPUT_MODEL` / `tool_output_model` | `toc_latte_v2` | model |
 | `COMPRESR_TOOL_OUTPUT_MIN_TOKENS` / `tool_output_min_tokens` | `1500` | skip smaller outputs |
 | `COMPRESR_TOOL_OUTPUT_TIMEOUT` / `tool_output_timeout` | `30` | request timeout (s) |
+| `COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB` / `tool_output_max_cache_mb` | `256` | best-effort `.compresr/cache` cap; `0` disables pruning |
+
+The cache cap is a disk-usage guard, not a retention guarantee. Old cached
+originals can be pruned after enough later compressed outputs are written in the
+same workspace, so a very old resumed session may contain a recovery reference
+whose backing cache file has since been evicted. Set `tool_output_max_cache_mb:
+0` if preserving historical recovery references across long-lived resumed
+sessions matters more than bounding `.compresr/cache` growth.
 
 ## Tests
 
