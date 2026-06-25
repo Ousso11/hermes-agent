@@ -36,6 +36,7 @@ def compress_tool_output(
     cache_id: str,
     client: CompresrToolOutputClient,
     task_id: str = "default",
+    max_cache_mb: int = 256,
 ) -> Tuple[str, Dict[str, Any]]:
     """Compress via Compresr, store the original, rewrite placeholders to refs.
 
@@ -60,16 +61,16 @@ def compress_tool_output(
     # and reference it by ABSOLUTE path so recovery survives a later `cd`. If the
     # write failed we get None back and fail open to the original tool output
     # rather than emit references to a file that was never written.
-    cache_path = cache.store_original(cache_id, content, task_id)
+    cache_path = cache.store_original(cache_id, content, task_id, max_cache_mb=max_cache_mb)
     if cache_path is None:
         info["error"] = "cache write failed"
         info["out_tokens"] = base_tok
         return content, info
 
     rewritten, gaps, ok = rewrite_placeholders(cache_path, content, compressed)
-    
+
     out_tok = count_tokens(rewritten)
-    
+
     if gaps:
         header = (
             f"[compresr: Output compressed. Original saved to {cache_path}]\n"

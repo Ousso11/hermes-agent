@@ -2901,7 +2901,9 @@ def _setup_context_compression(config: dict):
         tool outputs as they arrive, leaving addressable .compresr/cache
         references the agent can Read/Grep back (lossless by recovery).
 
-    Both fail open to Hermes's built-in behavior if the API is unreachable.
+    If the Compresr API is unreachable, compaction preserves the current
+    transcript instead of dropping turns with a placeholder summary; per-turn
+    tool-output compression leaves the original tool output unchanged.
     """
     print()
     print_header("Context Compression — Compresr (optional)")
@@ -2927,6 +2929,13 @@ def _setup_context_compression(config: dict):
         _set_plugin_enabled(config, "tool_output_compresr", False)
         print_info("Using the built-in compressor.")
         return
+
+    print_warning(
+        "Compresr is a third-party API. When enabled, Hermes sends "
+        "conversation text for compaction and large tool outputs for "
+        "per-turn compression, including file contents and command output "
+        "the agent has read or run."
+    )
 
     # Compresr needs an API key.
     existing = get_env_value("COMPRESR_API_KEY")

@@ -19,10 +19,10 @@ Activate via ``~/.hermes/config.yaml``::
     context:
       engine: compresr
 
-Configuration is read from environment first, then an optional ``compresr:``
-block in config.yaml:
+Configuration is read from environment first for secrets, then from an optional
+``compresr:`` block in config.yaml for non-secret settings:
 
-    COMPRESR_API_KEY        (required)  cmp_... key
+    COMPRESR_API_KEY        (required, .env only)  cmp_... key
     COMPRESR_BASE_URL       default https://api.compresr.ai/api
     COMPRESR_MODEL          default latte_v2  (latte_v1 | latte_v2)
     COMPRESR_TARGET_RATIO   optional Compresr ratio override (see semantics below)
@@ -53,6 +53,7 @@ from agent.context_compressor import (
     MINIMUM_CONTEXT_LENGTH,
     _SUMMARY_TOKENS_CEILING,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +81,7 @@ def _read_config_block() -> Dict[str, Any]:
 
     Environment variables take precedence; this only fills gaps. Never raises.
     """
-    home = os.environ.get("HERMES_HOME") or os.path.join(
-        os.path.expanduser("~"), ".hermes"
-    )
-    cfg_path = Path(home) / "config.yaml"
+    cfg_path = get_hermes_home() / "config.yaml"
     if not cfg_path.exists():
         return {}
     try:
@@ -112,7 +110,7 @@ class CompresrContextEngine(ContextCompressor):
                 return cfg[cfg_key]
             return default
 
-        self.compresr_api_key = _opt("COMPRESR_API_KEY", "api_key", "")
+        self.compresr_api_key = os.environ.get("COMPRESR_API_KEY", "")
         self.compresr_base_url = str(
             _opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)
         ).rstrip("/")
@@ -140,13 +138,17 @@ class CompresrContextEngine(ContextCompressor):
         # always calls update_model() right after, which sets the real values.
         kwargs.setdefault("model", "compresr-placeholder")
         kwargs.setdefault("config_context_length", 200_000)
+        # Compresr is an external service. If it is unavailable, preserve the
+        # current transcript instead of inserting a deterministic placeholder
+        # handoff and dropping the middle window.
+        kwargs.setdefault("abort_on_summary_failure", True)
         super().__init__(**kwargs)
 
         if not self.compresr_api_key:
             logger.warning(
                 "compresr: COMPRESR_API_KEY is not set — compaction will fail and "
-                "fall back to the built-in deterministic handoff. Set it in "
-                "~/.hermes/.env or the compresr: block of config.yaml."
+                "compression will be aborted without dropping context. Set it in "
+                "~/.hermes/.env."
             )
 
     # -- Identity ----------------------------------------------------------
