@@ -1185,7 +1185,7 @@ DEFAULT_CONFIG = {
         "timeout": 60,
         "coarse": False,
         "disable_placeholders": False,
-        "tool_output_enabled": False,
+        "tool_output_enabled": True,
         "tool_output_model": "toc_latte_v2",
         "tool_output_min_tokens": 1500,
         "tool_output_timeout": 30,
@@ -2999,7 +2999,7 @@ OPTIONAL_ENV_VARS = {
     "COMPRESR_API_KEY": {
         "description": "Compresr API key for context and tool-output compression",
         "prompt": "Compresr API key",
-        "url": "https://compresr.ai/dashboard/keys",
+        "url": "https://compresr.ai/dashboard/tokens",
         "tools": ["context_engine", "tool_output_compresr"],
         "password": True,
         "category": "tool",

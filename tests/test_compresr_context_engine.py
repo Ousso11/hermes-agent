@@ -100,7 +100,7 @@ def test_compresr_config_metadata_registered():
     from hermes_cli.config import DEFAULT_CONFIG, OPTIONAL_ENV_VARS, validate_config_structure
 
     compresr = DEFAULT_CONFIG["compresr"]
-    assert compresr["tool_output_enabled"] is False
+    assert compresr["tool_output_enabled"] is True
     assert compresr["tool_output_max_cache_mb"] == 256
 
     env_info = OPTIONAL_ENV_VARS["COMPRESR_API_KEY"]

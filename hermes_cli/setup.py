@@ -2941,7 +2941,7 @@ def _setup_context_compression(config: dict):
     existing = get_env_value("COMPRESR_API_KEY")
     if not existing:
         print()
-        print_info("Get a key at https://compresr.ai/dashboard/keys")
+        print_info("Get a key at https://compresr.ai/dashboard/tokens")
         api_key = prompt("Compresr API key (cmp_...)", password=True)
         if not api_key:
             print_warning("No API key provided. Leaving the built-in compressor in place.")
