@@ -20,14 +20,16 @@ Activation (opt-in, off by default):
     # ~/.hermes/.env
     COMPRESR_API_KEY=cmp_...
 
-Config (env first, then a ``compresr:`` block in config.yaml):
+Config (env first for secrets, then a ``compresr:`` block in config.yaml for
+non-secret settings):
 
-    COMPRESR_API_KEY                    (required) cmp_... key
+    COMPRESR_API_KEY                    (required, .env only) cmp_... key
     COMPRESR_BASE_URL                   default https://api.compresr.ai/api
     COMPRESR_TOOL_OUTPUT_ENABLED        "1" to enable (or compresr.tool_output_enabled)
     COMPRESR_TOOL_OUTPUT_MODEL          default toc_latte_v2
     COMPRESR_TOOL_OUTPUT_MIN_TOKENS     default 1500 (skip smaller outputs)
     COMPRESR_TOOL_OUTPUT_TIMEOUT        default 30 (seconds)
+    COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB   default 256 (0 disables pruning)
 """
 
 from __future__ import annotations
@@ -36,8 +38,9 @@ import hashlib
 import logging
 import os
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
+
+from hermes_constants import get_hermes_home
 
 from .client import CompresrToolOutputClient, DEFAULT_TOOL_OUTPUT_MODEL
 from .compress import compress_tool_output, count_tokens
@@ -47,6 +50,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = "https://api.compresr.ai/api"
 _DEFAULT_MIN_TOKENS = 1500
 _DEFAULT_TIMEOUT = 30
+_DEFAULT_MAX_CACHE_MB = 256
 _FALLBACK_QUERY = (
     "Preserve the facts, paths, identifiers, errors, and results in this tool "
     "output that are needed to continue the task."
@@ -58,10 +62,7 @@ _PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
 
 def _read_config_block() -> Dict[str, Any]:
     """Best-effort read of the ``compresr:`` block from config.yaml. Never raises."""
-    home = os.environ.get("HERMES_HOME") or os.path.join(
-        os.path.expanduser("~"), ".hermes"
-    )
-    cfg_path = Path(home) / "config.yaml"
+    cfg_path = get_hermes_home() / "config.yaml"
     if not cfg_path.exists():
         return {}
     try:
@@ -94,7 +95,7 @@ class ToolOutputCompressor:
                 return cfg[cfg_key]
             return default
 
-        self.api_key = _opt("COMPRESR_API_KEY", "api_key", "")
+        self.api_key = os.environ.get("COMPRESR_API_KEY", "")
         self.base_url = str(
             _opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)
         ).rstrip("/")
@@ -109,6 +110,13 @@ class ToolOutputCompressor:
         )
         self.timeout = int(
             _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT)
+        )
+        self.max_cache_mb = int(
+            _opt(
+                "COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB",
+                "tool_output_max_cache_mb",
+                _DEFAULT_MAX_CACHE_MB,
+            )
         )
 
         self._client = CompresrToolOutputClient(
@@ -150,7 +158,7 @@ class ToolOutputCompressor:
     def _cache_id(content: str) -> str:
         # Hash the CONTENT (not the tool_call_id) so two different outputs can
         # never collide onto one cache file; identical outputs safely dedupe.
-        return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
     # -- the hook ----------------------------------------------------------
 
@@ -191,6 +199,7 @@ class ToolOutputCompressor:
                 cache_id=cache_id,
                 client=self._client,
                 task_id=task_id,
+                max_cache_mb=self.max_cache_mb,
             )
         except Exception as e:  # compress is already fail-open, but be defensive
             self.errors += 1
@@ -227,6 +236,7 @@ class ToolOutputCompressor:
             "active": self.active,
             "model": self.model,
             "min_tokens": self.min_tokens,
+            "max_cache_mb": self.max_cache_mb,
             "calls": self.calls,
             "errors": self.errors,
             "tokens_saved": self.tokens_saved,

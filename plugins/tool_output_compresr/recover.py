@@ -21,6 +21,7 @@ is one ``read_file(offset, limit)`` away.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -40,7 +41,8 @@ MAX_RECOVERABLE_LINE_CHARS = 2000
 # Hermes's read_file_tool(path, offset>=1, limit) contract exactly.
 #   [compresr: 5 lines omitted · .compresr/cache/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
 ADDRESSABLE_REF_FORMAT = (
-    "[{count} lines omitted (Read offset={offset})]"
+    "[compresr: {count} lines omitted · {path} L{start}-{end} · "
+    "Read(offset={offset},limit={count}) or Grep to recover]"
 )
 
 # Strict, line-counted removal marker ("[N lines removed ...]"). Used only by
@@ -144,9 +146,17 @@ def _anchor_walk(
     anchored = False
     reordered = False
     cursor = 0
+    remaining_counts = Counter(o_norm)
+
+    def advance_cursor(new_cursor: int) -> None:
+        nonlocal cursor
+        if new_cursor <= cursor:
+            return
+        for line in o_norm[cursor:new_cursor]:
+            remaining_counts[line] -= 1
+        cursor = new_cursor
 
     def emit_gap(idx: int) -> None:
-        nonlocal cursor
         if idx > cursor:
             span = o_raw[cursor:idx]
             if any(len(l) > MAX_RECOVERABLE_LINE_CHARS for l in span):
@@ -159,7 +169,7 @@ def _anchor_walk(
                 gaps.append(g)
                 if build_out:
                     out_lines.append(build_reference(cache_path, g))
-            cursor = idx
+            advance_cursor(idx)
 
     for cl in compressed.split("\n"):
         # A line that is ONLY a drop marker (any unit/verb) is removed; the gap
@@ -168,6 +178,14 @@ def _anchor_walk(
             continue
         n = normalize_line(cl)
         if n == "":
+            if build_out:
+                out_lines.append(cl)
+            continue
+        if remaining_counts[n] > 1:
+            # A repeated single-line anchor can point at the wrong original
+            # span. Mark the output as low-confidence so callers can fail open
+            # instead of emitting confidently wrong recovery references.
+            reordered = True
             if build_out:
                 out_lines.append(cl)
             continue
@@ -183,7 +201,7 @@ def _anchor_walk(
         emit_gap(idx)
         if build_out:
             out_lines.append(cl)
-        cursor = idx + 1
+        advance_cursor(idx + 1)
         anchored = True
 
     # Trailing gap: the tail of the original was dropped after the last anchor.
@@ -235,13 +253,24 @@ def align_placeholders(
     gaps: List[Gap] = []
     reordered = False
     cursor = 0
+    pending_gap_start: int | None = None
+    pending_gap_count = 0
+
+    def close_pending_gap(end: int) -> None:
+        nonlocal pending_gap_start, pending_gap_count
+        if pending_gap_start is None:
+            return
+        if end >= pending_gap_start:
+            count = end - pending_gap_start + 1
+            gaps.append(Gap(start=pending_gap_start, end=end, count=count))
+        pending_gap_start = None
+        pending_gap_count = 0
+
     for p in parts:
         if p["is_gap"]:
-            end = cursor + p["gap"] - 1
-            if end >= len(o_raw):
-                end = len(o_raw) - 1
-            gaps.append(Gap(start=cursor, end=end, count=p["gap"]))
-            cursor += p["gap"]
+            if pending_gap_start is None:
+                pending_gap_start = cursor
+            pending_gap_count += p["gap"]
             continue
         seg = _split_trim_boundary(p["kept"])
         if not seg:
@@ -253,7 +282,11 @@ def align_placeholders(
             if at < 0:
                 return gaps, False, reordered
             reordered = True
+        close_pending_gap(at - 1)
         cursor = at + len(seg_n)
+    if pending_gap_start is not None:
+        end = min(len(o_raw) - 1, pending_gap_start + pending_gap_count - 1)
+        close_pending_gap(end)
     return gaps, True, reordered
 
 
@@ -267,11 +300,14 @@ def rewrite_placeholders(
     then to whole-file references (ok=false) for degenerate/paraphrased output.
     Returns ``(rewritten, gaps, ok)``.
     """
-    out, gaps, anchored, _ = _anchor_walk(cache_path, original, compressed, True)
-    if anchored:
+    out, gaps, anchored, anchor_reordered = _anchor_walk(
+        cache_path, original, compressed, True
+    )
+    if anchored and not anchor_reordered:
         return out, gaps, True
-
-    ag, aok, _ = align_placeholders(original, compressed)
+    ag, aok, align_reordered = align_placeholders(original, compressed)
+    if align_reordered:
+        return original, [], False
     if aok and ag:
         counter = {"i": 0}
 
@@ -283,6 +319,12 @@ def rewrite_placeholders(
 
         rewritten = _placeholder_re.sub(_repl, compressed)
         return rewritten, ag, True
+
+    if anchor_reordered:
+        return original, [], False
+
+    if _drop_marker_re.search(compressed) is None:
+        return original, [], False
 
     # Safe fallback: replace every drop marker (any format) with a whole-file ref.
     whole = build_reference(cache_path, _whole_file_gap(original))

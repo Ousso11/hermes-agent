@@ -6,6 +6,7 @@ addressable references map back to the exact dropped original line ranges.
 """
 
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +31,31 @@ def _recover_gap(original, gap):
     via read_file(offset=gap.start+1, limit=gap.count)."""
     lines = original.split("\n")
     return lines[gap.start : gap.end + 1]
+
+
+def _shell_file_ops_for_tmp_path(tmp_path):
+    from tools.file_operations import ShellFileOperations
+
+    class LocalEnv:
+        cwd = str(tmp_path)
+
+        def execute(self, command, cwd=None, timeout=None, stdin_data=None):
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd or self.cwd,
+                input=stdin_data,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            return {
+                "output": (result.stdout or "") + (result.stderr or ""),
+                "returncode": result.returncode,
+            }
+
+    return ShellFileOperations(LocalEnv(), cwd=str(tmp_path))
 
 
 def test_anchor_roundtrip_with_marker():
@@ -117,6 +143,73 @@ def test_reference_never_matches_drop_marker():
     assert recover._drop_marker_re.search(ref) is None
 
 
+def test_ambiguous_repeated_anchor_fails_open():
+    """Repeated single-line anchors can point at the wrong span, so recovery
+    should fail open instead of emitting a confidently wrong line reference."""
+    original = "\n".join(
+        [
+            "start",
+            "repeat",
+            "first hidden payload",
+            "repeat",
+            "second hidden payload",
+            "end",
+        ]
+    )
+    compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/ambiguous", original, compressed
+    )
+    assert not ok
+    assert gaps == []
+    assert rewritten == original
+
+
+def test_anchor_accepts_repeated_line_that_is_unique_after_cursor():
+    original = "\n".join(["same", "keep", "same", "tail"])
+    compressed = "\n".join(["keep", "same", "tail"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/repeated-after-cursor", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(0, 0, 1)]
+    assert ".compresr/cache/repeated-after-cursor L0-0" in rewritten
+
+
+def test_strict_marker_fallback_handles_repeated_kept_lines():
+    original = "\n".join(
+        ["header", "repeat", "payload a", "payload b", "repeat", "footer"]
+    )
+    compressed = "\n".join(["header", "repeat", "[2 lines removed]", "repeat", "footer"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/repeated-strict", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
+    assert ".compresr/cache/repeated-strict L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
+def test_strict_marker_fallback_extends_bad_count_to_next_anchor():
+    original = "\n".join(
+        ["header", "repeat", "payload a", "payload b", "repeat", "footer"]
+    )
+    compressed = "\n".join(["header", "repeat", "[1 lines removed]", "repeat", "footer"])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/bad-count", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
+    assert ".compresr/cache/bad-count L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
 def test_hook_skips_small_output():
     c = ToolOutputCompressor()
     c.enabled, c.api_key = True, "cmp_test"
@@ -133,7 +226,8 @@ def test_hook_compresses_large_output(monkeypatch):
     stored = {}
     monkeypatch.setattr(
         cache, "store_original",
-        lambda cid, content, task_id="default": stored.update({cid: content}) or cache.relative_cache_path(cid),
+        lambda cid, content, task_id="default", **_: stored.update({cid: content})
+        or cache.relative_cache_path(cid),
     )
     # Mock the API: pretend it kept the first 2 lines and dropped the rest.
     monkeypatch.setattr(
@@ -174,7 +268,7 @@ def test_hook_failopen_on_cache_write_failure(monkeypatch):
     c = ToolOutputCompressor()
     c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
     monkeypatch.setattr(
-        cache, "store_original", lambda cid, content, task_id="default": None
+        cache, "store_original", lambda cid, content, task_id="default", **_: None
     )
     monkeypatch.setattr(
         c._client,
@@ -198,7 +292,7 @@ def test_hook_failopen_when_no_recovery_reference(monkeypatch):
     monkeypatch.setattr(
         cache,
         "store_original",
-        lambda cid, content, task_id="default": cache.relative_cache_path(cid),
+        lambda cid, content, task_id="default", **_: cache.relative_cache_path(cid),
     )
     monkeypatch.setattr(
         c._client,
@@ -209,6 +303,111 @@ def test_hook_failopen_when_no_recovery_reference(monkeypatch):
         tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc5"
     )
     assert out is None
+
+
+def test_hook_failopen_on_ambiguous_recovery(monkeypatch):
+    """If recovery references would be ambiguous, the transform hook leaves the
+    original result in context instead of returning compressed text."""
+    from plugins.tool_output_compresr import cache
+
+    original = "\n".join(
+        [
+            "start",
+            "repeat",
+            "first hidden payload",
+            "repeat",
+            "second hidden payload",
+            "end",
+        ]
+    )
+    compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(
+        cache,
+        "store_original",
+        lambda cid, content, task_id="default", **_: cache.relative_cache_path(cid),
+    )
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: (compressed, {"tokens_saved": 10}),
+    )
+
+    assert c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "repeat"}, result=original, tool_call_id="tc6"
+    ) is None
+
+
+def test_tool_output_api_key_is_env_only(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMPRESR_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compresr:\n"
+        "  api_key: cmp_from_config\n"
+        "  tool_output_enabled: true\n"
+        "  tool_output_min_tokens: 7\n"
+        "  tool_output_max_cache_mb: 3\n",
+        encoding="utf-8",
+    )
+
+    c = ToolOutputCompressor()
+    assert c.api_key == ""
+    assert c.enabled is True
+    assert c.min_tokens == 7
+    assert c.max_cache_mb == 3
+    assert not c.active
+
+
+def test_backend_cache_prune_uses_backend_exec(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    newer = tmp_path / "newer"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    newer.write_text("y" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+    os.utime(old, (1, 1))
+    os.utime(newer, (2, 2))
+    os.utime(current, (3, 3))
+
+    file_ops = _shell_file_ops_for_tmp_path(tmp_path)
+    _prune_cache_dir_via_backend(file_ops, str(tmp_path), 20, str(current))
+
+    assert not old.exists()
+    assert newer.exists()
+    assert current.exists()
+    assert sum(path.stat().st_size for path in tmp_path.iterdir() if path.is_file()) <= 20
+
+
+def test_backend_cache_prune_disabled_leaves_files(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+
+    file_ops = _shell_file_ops_for_tmp_path(tmp_path)
+    _prune_cache_dir_via_backend(file_ops, str(tmp_path), 0, str(current))
+
+    assert old.exists()
+    assert current.exists()
+
+
+def test_backend_cache_prune_without_exec_does_not_touch_local_path(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+
+    _prune_cache_dir_via_backend(object(), str(tmp_path), 1, str(current))
+
+    assert old.exists()
+    assert current.exists()
 
 
 if __name__ == "__main__":

@@ -21,10 +21,19 @@ inherited verbatim. So an A/B against the built-in engine is a clean comparison
 of the *core compaction strategy* only.
 
 The query handed to Compresr is Hermes's own derived focus topic
-(`_derive_auto_focus_topic`), so compression is goal-aware. On any failure
-(missing key, transport/HTTP error, empty result) it returns `None` and the
-inherited `compress()` falls back to its deterministic handoff — **fail open** —
-with a short cooldown to avoid hammering a failing endpoint.
+(`_derive_auto_focus_topic`), so compression is goal-aware. Because Compresr is
+an external service, this engine defaults to preserving the current transcript
+when summary generation fails instead of dropping middle turns with a
+deterministic placeholder handoff. A short cooldown avoids hammering a failing
+endpoint. During a sustained Compresr outage, long conversations may stop
+compacting until the API recovers or the user starts a fresh session; this is a
+deliberate fail-open tradeoff to avoid losing context.
+
+## Data sent to Compresr
+
+When enabled, Hermes sends the middle conversation window selected for
+compaction to the configured Compresr API endpoint. Do not enable this engine
+unless that third-party processing is acceptable for your deployment.
 
 ## Activation
 
@@ -43,7 +52,7 @@ Or run `hermes setup` and choose a Compresr option under **Context Compression**
 
 | env / `compresr:` key | default | meaning |
 |---|---|---|
-| `COMPRESR_API_KEY` / `api_key` | — | **required** `cmp_…` key |
+| `COMPRESR_API_KEY` | — | **required** `cmp_…` key, read from `.env` only |
 | `COMPRESR_BASE_URL` / `base_url` | `https://api.compresr.ai/api` | API base |
 | `COMPRESR_MODEL` / `model` | `latte_v2` | `latte_v1` \| `latte_v2` |
 | `COMPRESR_TARGET_RATIO` / `target_ratio` | — | override (Compresr Nx / removal semantics) |

@@ -7,8 +7,9 @@ plugin to a no-op:
 
   * the override's signature matches the parent's,
   * a successful API call returns the prefixed compressed body,
-  * an API failure returns None (so inherited compress() falls back) and trips
-    the error counter + cooldown.
+  * an API failure returns None and trips the error counter + cooldown,
+  * the external engine defaults to aborting failed compactions so context is
+    preserved instead of replaced by a deterministic placeholder.
 """
 
 import inspect
@@ -63,6 +64,7 @@ def test_failure_falls_back_to_none():
     assert out is None  # → inherited compress() uses its deterministic handoff
     assert e.compresr_errors == 1
     assert e._summary_failure_cooldown_until > 0  # cooldown tripped
+    assert e.abort_on_summary_failure is True
 
 
 def test_empty_compression_is_treated_as_failure():
@@ -78,6 +80,33 @@ def test_ratio_mapping_keep_to_nx():
     assert e._target_compression_ratio() == 5.0  # → 5x
     e.compresr_ratio_override = 0.8
     assert e._target_compression_ratio() == 0.8  # explicit override wins
+
+
+def test_api_key_is_env_only(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMPRESR_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compresr:\n  api_key: cmp_from_config\n  model: latte_v1\n",
+        encoding="utf-8",
+    )
+
+    e = CompresrContextEngine()
+    assert e.compresr_api_key == ""
+    assert e.compresr_model == "latte_v1"
+    assert not e.is_available()
+
+
+def test_compresr_config_metadata_registered():
+    from hermes_cli.config import DEFAULT_CONFIG, OPTIONAL_ENV_VARS, validate_config_structure
+
+    compresr = DEFAULT_CONFIG["compresr"]
+    assert compresr["tool_output_enabled"] is True
+    assert compresr["tool_output_max_cache_mb"] == 256
+
+    env_info = OPTIONAL_ENV_VARS["COMPRESR_API_KEY"]
+    assert env_info["password"] is True
+    assert env_info["tools"] == ["context_engine", "tool_output_compresr"]
+    assert validate_config_structure({"compresr": {"tool_output_enabled": True}}) == []
 
 
 if __name__ == "__main__":
