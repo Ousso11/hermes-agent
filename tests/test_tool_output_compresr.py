@@ -138,9 +138,11 @@ def test_reference_uses_given_absolute_path():
 
 
 def test_reference_never_matches_drop_marker():
-    """Our own 'omitted' reference must not be re-detected as a drop marker."""
+    """Our own 'omitted' reference must not be re-detected as a drop marker by
+    EITHER the general signal regex or the broadened counted-marker regex."""
     ref = recover.build_reference(".compresr/cache/x", recover.Gap(0, 4, 5))
     assert recover._drop_marker_re.search(ref) is None
+    assert recover._placeholder_re.search(ref) is None
 
 
 def test_ambiguous_repeated_anchor_fails_open():
@@ -207,6 +209,73 @@ def test_strict_marker_fallback_extends_bad_count_to_next_anchor():
     assert ok
     assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
     assert ".compresr/cache/bad-count L2-3" in rewritten
+    assert "Read(offset=3,limit=2)" in rewritten
+
+
+def test_inline_token_marker_anchors_and_does_not_leak():
+    """toc_latte_v2 attaches its marker to the END of a kept line
+    ("...kept[N tokens dropped]"), not on its own line. The kept text must still
+    anchor (so the gap boundary is correct) and the marker must not leak into the
+    rewritten output. Regression for the live-API round-trip."""
+    original = "\n".join(["a one", "b two", "c three", "d four", "e five"])
+    # Keeps a/b verbatim, marker attached to "b two", drops c/d/e.
+    compressed = "a one\nb two[3 tokens dropped]"
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/inline", original, compressed
+    )
+
+    assert ok
+    assert "[3 tokens dropped]" not in rewritten  # stripped, no leak into context
+    assert "b two" in rewritten  # kept line preserved, clean
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 4, 3)]  # c/d/e, not b
+    assert "Read(offset=3,limit=3)" in rewritten
+
+
+def test_midline_marker_hybrid_is_dropped_not_corrupting():
+    """Live toc_latte_v2 sometimes fuses a WRONG prefix + the marker onto the next
+    kept line ("[wrong-ts][N tokens dropped] real line"). That hybrid matches
+    nothing verbatim; it must be dropped (pure gap signal), not emitted as a
+    corrupted line — and the real span recovered by anchoring around it. Regression
+    for the real-Hermes round-trip on a dense log."""
+    original = "\n".join([f"L{i} val{i}" for i in range(8)])  # L0..L7
+    compressed = "\n".join([
+        "L0 val0", "L1 val1",
+        "WRONGPREFIX[4 tokens dropped] L6 val6",  # hybrid: matches nothing verbatim
+        "L7 val7",
+    ])
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/hybrid", original, compressed
+    )
+
+    assert ok
+    assert "[4 tokens dropped]" not in rewritten   # marker stripped
+    assert "WRONGPREFIX" not in rewritten          # corrupted hybrid dropped
+    assert [(g.start, g.end) for g in gaps] == [(2, 6)]  # L2..L6 recovered as a gap
+    assert "Read(offset=3,limit=5)" in rewritten
+
+
+def test_strict_marker_fallback_handles_token_markers():
+    """Abstractive output emits ``[N tokens dropped]``, not ``[N lines removed]``.
+    The marker-count fallback must still split on it and emit an addressable Read
+    reference — the count's unit is irrelevant, the gap's line range is anchored.
+    (Regression for: strict regex only matched 'lines removed' → 0 token matches.)
+    """
+    original = "\n".join(
+        ["header", "repeat", "payload a", "payload b", "repeat", "footer"]
+    )
+    compressed = "\n".join(
+        ["header", "repeat", "[2 tokens dropped]", "repeat", "footer"]
+    )
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/token-strict", original, compressed
+    )
+
+    assert ok
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
+    assert ".compresr/cache/token-strict L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
 
 

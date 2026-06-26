@@ -79,7 +79,7 @@ Or run `hermes setup` and choose **Compresr** for the compression engine.
 | `COMPRESR_API_KEY` | — | **required** `cmp_…` key, read from `.env` only |
 | `COMPRESR_BASE_URL` / `base_url` | `https://api.compresr.ai/api` | API base |
 | `COMPRESR_TOOL_OUTPUT_ENABLED` / `tool_output_enabled` | `true` | master switch |
-| `COMPRESR_TOOL_OUTPUT_MODEL` / `tool_output_model` | `toc_latte_v2` | model |
+| `COMPRESR_TOOL_OUTPUT_MODEL` / `tool_output_model` | `toc_latte_v2` | model (tool-output endpoint only accepts `toc_*` models) |
 | `COMPRESR_TOOL_OUTPUT_MIN_TOKENS` / `tool_output_min_tokens` | `1500` | skip smaller outputs |
 | `COMPRESR_TOOL_OUTPUT_TIMEOUT` / `tool_output_timeout` | `30` | request timeout (s) |
 | `COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB` / `tool_output_max_cache_mb` | `256` | best-effort `.compresr/cache` cap; `0` disables pruning |

@@ -45,18 +45,24 @@ ADDRESSABLE_REF_FORMAT = (
     "Read(offset={offset},limit={count}) or Grep to recover]"
 )
 
-# Strict, line-counted removal marker ("[N lines removed ...]"). Used only by
-# the marker-count alignment fallback, where the count denotes whole lines.
-_placeholder_re = re.compile(r"\[\s*(\d+)\s+lines?\s+removed[^\]]*\]", re.IGNORECASE)
+# Drop-verb vocabulary shared by both marker regexes. Excludes "omitted" (the
+# verb our own references use) so a reference is never read as a drop marker.
+_DROP_VERB = r"removed|dropped|truncated|elided|snipped|redacted|hidden|stripped|cut"
 
-# The GENERAL family of "content was dropped here" markers a compressor may
-# emit, regardless of unit (tokens/lines/chars/words) or verb. The anchor-based
-# rewriter treats these purely as a SIGNAL that a gap exists; the recovered line
-# range comes from anchoring, so the marker's unit/count never matters. It
-# deliberately excludes "omitted" — the verb our own references use — so a
-# reference is never mistaken for a drop marker.
+# Counted drop marker ("[N lines removed]", "[N tokens dropped]", ...). Any unit,
+# any verb — toc_latte_v2 emits tokens, not lines. Count is only a tie-breaker for
+# a trailing gap; real line ranges come from anchoring.
+_placeholder_re = re.compile(
+    r"\[\s*(\d+)\s+"
+    r"(?:lines?|tokens?|chars?|characters?|words?|bytes?)?\s*"
+    rf"(?:{_DROP_VERB})[^\]]*\]",
+    re.IGNORECASE,
+)
+
+# General "content dropped here" marker — treated purely as a gap signal; the
+# line range comes from anchoring, so unit/count never matter.
 _drop_marker_re = re.compile(
-    r"\[[^\]]*\b(?:removed|dropped|truncated|elided|snipped|redacted|hidden|stripped|cut)\b[^\]]*\]",
+    rf"\[[^\]]*\b(?:{_DROP_VERB})\b[^\]]*\]",
     re.IGNORECASE,
 )
 
@@ -171,14 +177,17 @@ def _anchor_walk(
                     out_lines.append(build_reference(cache_path, g))
             advance_cursor(idx)
 
-    for cl in compressed.split("\n"):
-        # A line that is ONLY a drop marker (any unit/verb) is removed; the gap
-        # it implies is recovered from the anchor skip instead.
-        if _drop_marker_re.search(cl) and _drop_marker_re.sub("", cl).strip() == "":
-            continue
+    for raw_cl in compressed.split("\n"):
+        # Strip inline drop markers before anchoring: toc_latte_v2 fuses them onto
+        # the end of a kept line ("…kept text[54 tokens dropped]"), which otherwise
+        # fails to anchor and leaks the marker into output.
+        had_marker = bool(_drop_marker_re.search(raw_cl))
+        cl = _drop_marker_re.sub("", raw_cl) if had_marker else raw_cl
         n = normalize_line(cl)
         if n == "":
-            if build_out:
+            # Marker-only line → drop it (gap is anchored); keep genuinely blank
+            # original lines to stay aligned.
+            if build_out and not had_marker:
                 out_lines.append(cl)
             continue
         if remaining_counts[n] > 1:
@@ -191,10 +200,15 @@ def _anchor_walk(
             continue
         idx = _find_run(o_norm, [n], cursor)
         if idx < 0:
-            # Not verbatim-after-cursor: a paraphrase or a reordered anchor. Keep
-            # it as-is and do NOT fabricate a gap (avoids mis-anchoring).
+            # Not verbatim-after-cursor.
             if _find_run(o_norm, [n], 0) >= 0:
+                # Same content elsewhere → reordered anchor; flag low-confidence.
                 reordered = True
+            elif had_marker:
+                # Marker-bearing line matching nothing in the original is a
+                # fabricated hybrid (wrong-ts + marker). Pure gap signal: drop it.
+                continue
+            # Otherwise a genuine paraphrase: keep as-is, do NOT fabricate a gap.
             if build_out:
                 out_lines.append(cl)
             continue
@@ -232,7 +246,8 @@ def infer_gaps(original: str, compressed: str) -> Tuple[List[Gap], bool, bool]:
 def align_placeholders(
     original: str, compressed: str
 ) -> Tuple[List[Gap], bool, bool]:
-    """Map each strict ``[N lines removed]`` marker back to a concrete line range.
+    """Map each counted drop marker (``[N lines removed]``, ``[N tokens dropped]``,
+    ...) back to a concrete line range.
 
     The compressed text is verbatim KEPT segments separated by markers; we anchor
     each kept segment in order and the run between two anchors is the removed gap.
