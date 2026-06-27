@@ -16,9 +16,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, Tuple
 
-# v2 + coarse is the measured-best config for dense tool output (grep listings:
-# ~1%->50% off) while staying ~99% extractive so dropped spans remain
-# recoverable by anchoring.
+# /compress/tool-output/ only accepts toc_* models (latte_v2 → HTTP 422). Emits
+# "[N tokens dropped]" markers; recover.py anchors kept spans around them.
 DEFAULT_TOOL_OUTPUT_MODEL = "toc_latte_v2"
 
 
