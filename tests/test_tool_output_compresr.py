@@ -33,6 +33,11 @@ def _recover_gap(original, gap):
     return lines[gap.start : gap.end + 1]
 
 
+def _assert_gap_is_read_addressable(rewritten, gap, cache_path):
+    assert f"{cache_path} L{gap.start}-{gap.end}" in rewritten
+    assert f"Read(offset={gap.start + 1},limit={gap.count})" in rewritten
+
+
 def _shell_file_ops_for_tmp_path(tmp_path):
     from tools.file_operations import ShellFileOperations
 
@@ -279,6 +284,38 @@ def test_strict_marker_fallback_handles_token_markers():
     assert "Read(offset=3,limit=2)" in rewritten
 
 
+def test_multiple_inline_token_markers_emit_exact_read_ranges():
+    original = "\n".join(
+        [
+            "header",
+            "keep alpha",
+            "hidden one",
+            "hidden two",
+            "keep beta",
+            "hidden three",
+            "hidden four",
+            "footer",
+        ]
+    )
+    compressed = "\n".join(
+        [
+            "header",
+            "keep alpha[2 tokens dropped]",
+            "keep beta[2 tokens dropped]",
+            "footer",
+        ]
+    )
+    cache_path = ".compresr/cache/multi-inline"
+
+    rewritten, gaps, ok = recover.rewrite_placeholders(cache_path, original, compressed)
+
+    assert ok
+    assert "tokens dropped" not in rewritten
+    assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2), (5, 6, 2)]
+    for gap in gaps:
+        _assert_gap_is_read_addressable(rewritten, gap, cache_path)
+
+
 def test_hook_skips_small_output():
     c = ToolOutputCompressor()
     c.enabled, c.api_key = True, "cmp_test"
@@ -312,6 +349,59 @@ def test_hook_compresses_large_output(monkeypatch):
     # The EXACT text the API compressed was persisted so the reference resolves.
     cache_id = c._cache_id(ORIGINAL)
     assert cache_id in stored
+
+
+def test_hook_rewrites_inline_token_markers_to_recovery_refs(monkeypatch):
+    from plugins.tool_output_compresr import cache
+
+    original = "\n".join(
+        [
+            "header status=ok",
+            "keep alpha result",
+            "hidden diagnostic one",
+            "hidden diagnostic two",
+            "hidden diagnostic three",
+            "keep beta result",
+            "footer complete",
+        ]
+    )
+    compressed = "\n".join(
+        [
+            "header status=ok",
+            "keep alpha result[3 tokens dropped]",
+            "keep beta result",
+            "footer complete",
+        ]
+    )
+    cache_path = ".compresr/cache/inline-hook"
+    stored = {}
+
+    def store_original(cid, content, task_id="default", **_):
+        stored[cid] = (content, task_id)
+        return cache_path
+
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(cache, "store_original", store_original)
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: (compressed, {"tokens_saved": 12}),
+    )
+
+    out = c.on_transform_tool_result(
+        tool_name="terminal",
+        args={"command": "show synthetic diagnostics"},
+        result=original,
+        task_id="task-inline",
+        tool_call_id="tc-inline",
+    )
+
+    assert out is not None
+    assert "tokens dropped" not in out
+    assert f"{cache_path} L2-4" in out
+    assert "Read(offset=3,limit=3)" in out
+    assert stored[c._cache_id(original)] == (original, "task-inline")
 
 
 def test_hook_failopen_on_api_error(monkeypatch):
