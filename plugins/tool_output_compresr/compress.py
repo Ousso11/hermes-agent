@@ -37,6 +37,7 @@ def compress_tool_output(
     client: CompresrToolOutputClient,
     task_id: str = "default",
     max_cache_mb: int = 256,
+    target_ratio: float = 2.0,
 ) -> Tuple[str, Dict[str, Any]]:
     """Compress via Compresr, store the original, rewrite placeholders to refs.
 
@@ -49,7 +50,8 @@ def compress_tool_output(
 
     try:
         compressed, stats = client.compress(
-            tool_output=content, query=query, tool_name=tool_name, coarse=True
+            tool_output=content, query=query, tool_name=tool_name,
+            coarse=True, target_ratio=target_ratio,
         )
     except Exception as e:  # fail-open to the original tool output
         logger.warning("tool_output_compresr: API failed (%s) — leaving original", e)
@@ -71,7 +73,7 @@ def compress_tool_output(
 
     out_tok = count_tokens(rewritten)
 
-    if gaps:
+    if gaps and ok:
         header = (
             f"[compresr: Output compressed. Original saved to {cache_path}]\n"
             f"[Tokens: {base_tok} cached, {out_tok} non-cached]\n"
