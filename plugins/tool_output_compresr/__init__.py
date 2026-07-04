@@ -35,10 +35,11 @@ non-secret settings):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 
@@ -51,6 +52,7 @@ _DEFAULT_BASE_URL = "https://api.compresr.ai/api"
 _DEFAULT_MIN_TOKENS = 1500
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_MAX_CACHE_MB = 256
+_DEFAULT_TARGET_RATIO = 2.0
 _FALLBACK_QUERY = (
     "Preserve the facts, paths, identifiers, errors, and results in this tool "
     "output that are needed to continue the task."
@@ -58,6 +60,45 @@ _FALLBACK_QUERY = (
 # Args we mine, in priority order, to reconstruct the tool's intent as a query.
 _QUERY_ARG_KEYS = ("query", "pattern", "command", "q", "search", "regex", "url")
 _PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
+
+# Tool → key holding the plain-text payload inside a JSON envelope. Compressing
+# the envelope directly defeats line-oriented anchoring (escaped "\n" doesn't
+# split); unwrapping restores real newlines so anchoring can align.
+_UNWRAPPABLE_JSON_TOOLS: Dict[str, str] = {
+    "read_file": "content",
+    "terminal": "output",
+    "execute_code": "output",
+    "shell": "output",
+    "run_shell": "output",
+    "search_files": "content",
+    "grep": "output",
+}
+
+
+def _try_unwrap_json_tool_result(
+    tool_name: str, result: str
+) -> Tuple[Optional[str], Optional[Callable[[str], str]]]:
+    key = _UNWRAPPABLE_JSON_TOOLS.get(tool_name)
+    if key is None:
+        return None, None
+    if not result.lstrip().startswith("{"):
+        return None, None
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    inner = parsed.get(key)
+    if not isinstance(inner, str) or not inner.strip():
+        return None, None
+
+    def splice(new_inner: str) -> str:
+        out = dict(parsed)
+        out[key] = new_inner
+        return json.dumps(out, ensure_ascii=False)
+
+    return inner, splice
 
 
 def _read_config_block() -> Dict[str, Any]:
@@ -116,6 +157,13 @@ class ToolOutputCompressor:
                 "COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB",
                 "tool_output_max_cache_mb",
                 _DEFAULT_MAX_CACHE_MB,
+            )
+        )
+        self.target_ratio = float(
+            _opt(
+                "COMPRESR_TOOL_OUTPUT_TARGET_RATIO",
+                "tool_output_target_ratio",
+                _DEFAULT_TARGET_RATIO,
             )
         )
 
@@ -190,16 +238,23 @@ class ToolOutputCompressor:
             return None
 
         query = self._derive_query(tool_name, args)
-        cache_id = self._cache_id(result)
+
+        inner_text, splice = _try_unwrap_json_tool_result(tool_name, result)
+        compress_target = inner_text if inner_text is not None else result
+        if inner_text is not None and count_tokens(inner_text) < self.min_tokens:
+            return None
+
+        cache_id = self._cache_id(compress_target)
         try:
             out, info = compress_tool_output(
                 query=query,
-                content=result,
+                content=compress_target,
                 tool_name=tool_name,
                 cache_id=cache_id,
                 client=self._client,
                 task_id=task_id,
                 max_cache_mb=self.max_cache_mb,
+                target_ratio=self.target_ratio,
             )
         except Exception as e:  # compress is already fail-open, but be defensive
             self.errors += 1
@@ -212,22 +267,42 @@ class ToolOutputCompressor:
             self._cooldown_until = now + 30.0
         if not info.get("called_api"):
             return None  # API failed → leave the original output unchanged
+        if not info.get("anchored_ok"):
+            # Recovery anchoring failed — the "[compresr:]" header would be a
+            # lie because the L<start>-<end> references don't correspond to
+            # the dropped spans. Fail open to preserve the lossless-by-recovery
+            # invariant: better to send the raw output than silently drop
+            # content behind broken references.
+            self.errors += 1
+            logger.warning(
+                "tool_output_compresr: anchoring failed for %s "
+                "(base=%d out=%d gaps=%d) — falling back to original",
+                tool_name,
+                info.get("base_tokens", 0),
+                info.get("out_tokens", 0),
+                info.get("gaps", 0),
+            )
+            return None
         if "[compresr:" not in out:
-            # No recovery reference was emitted (degenerate/unanchored output, or
-            # nothing was dropped) — never hand back silently-lossy text; fail open.
+            # No recovery reference was emitted (nothing was dropped, or a
+            # degenerate output) — never hand back silently-lossy text; fail
+            # open. Kept for defense-in-depth alongside the anchored_ok gate.
             return None
         saved = max(0, info.get("base_tokens", 0) - info.get("out_tokens", 0))
         self.calls += 1
         self.tokens_saved += saved
         logger.info(
-            "tool_output_compresr: %s %d→%d tokens (saved %d, %d gaps, anchored=%s)",
+            "tool_output_compresr: %s %d→%d tokens (saved %d, %d gaps, anchored=%s, unwrapped=%s)",
             tool_name,
             info.get("base_tokens", 0),
             info.get("out_tokens", 0),
             saved,
             info.get("gaps", 0),
             info.get("anchored_ok"),
+            splice is not None,
         )
+        if splice is not None:
+            return splice(out)
         return out
 
     def get_status(self) -> Dict[str, Any]:
