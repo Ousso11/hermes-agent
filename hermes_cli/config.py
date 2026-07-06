@@ -1189,8 +1189,8 @@ DEFAULT_CONFIG = {
         "tool_output_model": "toc_latte_v2",
         "tool_output_min_tokens": 1500,
         "tool_output_timeout": 30,
-        # Best-effort cap for .compresr/cache originals written by the
-        # per-turn tool-output plugin. 0 disables pruning.
+        # Best-effort cap for Hermes-managed compresr originals written by
+        # the per-turn tool-output plugin. 0 disables pruning.
         "tool_output_max_cache_mb": 256,
     },
 

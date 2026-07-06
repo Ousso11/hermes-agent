@@ -6,7 +6,7 @@ marker into an ADDRESSABLE reference the agent can recover with its NATIVE
 ``read_file``/``grep`` tools — either the whole cached original or a surgical
 slice::
 
-    [compresr: 5 lines omitted · .compresr/cache/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
+    [compresr: 5 lines omitted · /root/.hermes/cache/compresr/tool-output/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
 
 The mechanism does NOT trust marker counts/units. The primary path anchors the
 compressed output's verbatim KEPT lines against the cached original and derives
@@ -25,10 +25,9 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import List, Tuple
 
-# Workspace-relative directory that holds cached originals. Hermes's native
-# read_file/grep tools resolve relative paths against the task's tracked cwd,
-# so a reference pointing here is directly recoverable by the model.
-CACHE_DIR_NAME = ".compresr/cache"
+# Hermes-managed cache directory that holds cached originals. The recovery
+# marker embeds whatever path is agent-visible for the active backend.
+CACHE_DIR_NAME = "cache/compresr/tool-output"
 
 # Hermes's read_file path truncates any single line longer than this (see
 # tools/tool_output_limits.py DEFAULT_MAX_LINE_LENGTH) and appends "... [truncated]".
@@ -39,7 +38,7 @@ MAX_RECOVERABLE_LINE_CHARS = 2000
 
 # The LLM-visible recoverable placeholder. Offsets are 1-indexed to match
 # Hermes's read_file_tool(path, offset>=1, limit) contract exactly.
-#   [compresr: 5 lines omitted · .compresr/cache/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
+#   [compresr: 5 lines omitted · /root/.hermes/cache/compresr/tool-output/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
 ADDRESSABLE_REF_FORMAT = (
     "[compresr: {count} lines omitted · {path} L{start}-{end} · "
     "Read(offset={offset},limit={count}) or Grep to recover]"

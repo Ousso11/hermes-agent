@@ -6,8 +6,9 @@ description: >-
   transform_tool_result hook — before they bloat the context window — using
   Compresr's query-specific tool-output API (toc_latte_v2), with the tool's
   intent as the query. Every dropped span is rewritten into an addressable
-  recovery reference (.compresr/cache/<id> · Read(offset,limit) or Grep) so the
-  agent can recover the original verbatim. Lossless-by-recovery, fail-open, and
+  recovery reference under Hermes's managed cache
+  (cache/compresr/tool-output/<id> · Read(offset,limit) or Grep) so the agent
+  can recover the original verbatim. Lossless-by-recovery, fail-open, and
   enabled by default when the plugin is loaded. Complements the
   compaction-time context_engine/compresr plugin.
 author: "Compresr (YC W26)"
