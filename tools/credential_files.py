@@ -338,17 +338,30 @@ def iter_skills_files(
 
 
 # ---------------------------------------------------------------------------
-# Cache directory mounts (documents, images, audio, screenshots)
+# Cache directory mounts (documents, images, audio, videos, screenshots)
 # ---------------------------------------------------------------------------
 
-# The four cache subdirectories that should be mirrored into remote backends.
-# Each tuple is (new_subpath, old_name) matching hermes_constants.get_hermes_dir().
-_CACHE_DIRS: list[tuple[str, str]] = [
+# The cache subdirectories that should be mirrored into remote backends.
+# Each tuple is (new_subpath, old_name). When old_name is None, the path has
+# no legacy fallback and always resolves to the new layout.
+_CACHE_DIRS: list[tuple[str, str | None]] = [
     ("cache/documents", "document_cache"),
     ("cache/images", "image_cache"),
     ("cache/audio", "audio_cache"),
+    ("cache/videos", "video_cache"),
     ("cache/screenshots", "browser_screenshots"),
+    ("cache/web", "web_cache"),
+    ("cache/delegation", "delegation_cache"),
+    ("cache/compresr/tool-output", None),
 ]
+
+
+def _resolve_cache_dir(new_subpath: str, old_name: str | None) -> Path:
+    from hermes_constants import get_hermes_dir, get_hermes_home
+
+    if old_name is None:
+        return get_hermes_home() / new_subpath
+    return get_hermes_dir(new_subpath, old_name)
 
 
 def get_cache_directory_mounts(
@@ -360,14 +373,16 @@ def get_cache_directory_mounts(
     ``container_path`` keys.  The host path is resolved via
     ``get_hermes_dir()`` for backward compatibility with old directory layouts.
     """
-    from hermes_constants import get_hermes_dir
-
     mounts: List[Dict[str, str]] = []
+    seen_container_paths: set[str] = set()
     for new_subpath, old_name in _CACHE_DIRS:
-        host_dir = get_hermes_dir(new_subpath, old_name)
+        host_dir = _resolve_cache_dir(new_subpath, old_name)
         if host_dir.is_dir():
             # Always map to the *new* container layout regardless of host layout.
             container_path = f"{container_base.rstrip('/')}/{new_subpath}"
+            if container_path in seen_container_paths:
+                continue
+            seen_container_paths.add(container_path)
             mounts.append({
                 "host_path": str(host_dir),
                 "container_path": container_path,
@@ -428,11 +443,9 @@ def iter_cache_files(
     Used by Modal to upload files individually and resync before each command.
     Skips symlinks.  The container paths use the new ``cache/<subdir>`` layout.
     """
-    from hermes_constants import get_hermes_dir
-
     result: List[Dict[str, str]] = []
     for new_subpath, old_name in _CACHE_DIRS:
-        host_dir = get_hermes_dir(new_subpath, old_name)
+        host_dir = _resolve_cache_dir(new_subpath, old_name)
         if not host_dir.is_dir():
             continue
         container_root = f"{container_base.rstrip('/')}/{new_subpath}"
@@ -450,5 +463,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

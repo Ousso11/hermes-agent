@@ -25,6 +25,30 @@ ORIGINAL = "\n".join(
     ]
 )
 
+CACHE_ROOT = "/root/.hermes/cache/compresr/tool-output"
+
+
+def _cache_path(cache_id: str) -> str:
+    return f"{CACHE_ROOT}/{cache_id}"
+
+
+def _fake_env(name: str, **attrs):
+    env = type(name, (), {})()
+    for key, value in attrs.items():
+        setattr(env, key, value)
+    return env
+
+
+class _FakeSyncManager:
+    def __init__(self, boom: Exception | None = None):
+        self.calls = []
+        self.boom = boom
+
+    def sync(self, force=False):
+        self.calls.append(force)
+        if self.boom is not None:
+            raise self.boom
+
 
 def _recover_gap(original, gap):
     """Reconstruct the dropped span from the cached original, as the agent would
@@ -68,7 +92,7 @@ def test_anchor_roundtrip_with_marker():
         ["line0 alpha", "line1 bravo", "[2 lines removed]", "line4 echo", "line5 foxtrot"]
     )
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/abc123", ORIGINAL, compressed
+        _cache_path("abc123"), ORIGINAL, compressed
     )
     assert ok
     assert len(gaps) == 1
@@ -77,7 +101,7 @@ def test_anchor_roundtrip_with_marker():
     # The dropped span is exactly recoverable.
     assert _recover_gap(ORIGINAL, g) == ["line2 charlie", "line3 delta"]
     # The reference is addressable and offset is 1-indexed (start+1).
-    assert ".compresr/cache/abc123 L2-3" in rewritten
+    assert f"{CACHE_ROOT}/abc123 L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
     assert "line4 echo" in rewritten  # kept content preserved verbatim
 
@@ -85,7 +109,7 @@ def test_anchor_roundtrip_with_marker():
 def test_anchor_silent_drop_no_marker():
     """Even with NO drop marker, anchoring infers the gap from the skip."""
     compressed = "\n".join(["line0 alpha", "line1 bravo", "line4 echo", "line5 foxtrot"])
-    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id1", ORIGINAL, compressed)
+    _, gaps, ok = recover.rewrite_placeholders(_cache_path("id1"), ORIGINAL, compressed)
     assert ok
     assert len(gaps) == 1
     assert (gaps[0].start, gaps[0].end) == (2, 3)
@@ -96,24 +120,24 @@ def test_anchor_tolerates_whitespace_drift():
     compressed = "\n".join(
         ["line0   alpha", "line1\tbravo", "[tokens dropped]", "line4 echo", "line5 foxtrot"]
     )
-    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id2", ORIGINAL, compressed)
+    _, gaps, ok = recover.rewrite_placeholders(_cache_path("id2"), ORIGINAL, compressed)
     assert ok
     assert (gaps[0].start, gaps[0].end) == (2, 3)
 
 
 def test_trailing_gap():
     compressed = "\n".join(["line0 alpha", "line1 bravo"])
-    _, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id3", ORIGINAL, compressed)
+    _, gaps, ok = recover.rewrite_placeholders(_cache_path("id3"), ORIGINAL, compressed)
     assert ok
     assert gaps[-1].end == 5  # tail dropped after last anchor
 
 
 def test_fully_paraphrased_falls_back_to_whole_file():
     compressed = "a totally rewritten summary with no verbatim lines [content truncated]"
-    rewritten, gaps, ok = recover.rewrite_placeholders(".compresr/cache/id4", ORIGINAL, compressed)
+    rewritten, gaps, ok = recover.rewrite_placeholders(_cache_path("id4"), ORIGINAL, compressed)
     assert not ok
     assert gaps == [recover._whole_file_gap(ORIGINAL)]
-    assert ".compresr/cache/id4" in rewritten
+    assert f"{CACHE_ROOT}/id4" in rewritten
 
 
 def test_long_line_span_kept_inline_not_dropped():
@@ -125,7 +149,7 @@ def test_long_line_span_kept_inline_not_dropped():
     lines[10] = long_line
     original = "\n".join(lines)
     compressed = "\n".join(lines[:9] + ["[4 lines removed]"] + lines[13:])
-    rewritten, gaps, ok = recover.rewrite_placeholders(".compresr/cache/ll", original, compressed)
+    rewritten, gaps, ok = recover.rewrite_placeholders(_cache_path("ll"), original, compressed)
     assert long_line in rewritten           # kept verbatim, recoverable in-context
     assert all(g.start > 12 or g.end < 9 for g in gaps)  # the long span isn't a gap
 
@@ -136,7 +160,7 @@ def test_reference_uses_given_absolute_path():
     compressed = "\n".join(
         ["line0 alpha", "line1 bravo", "[2 lines removed]", "line4 echo", "line5 foxtrot"]
     )
-    abs_path = "/work/sub/.compresr/cache/abc123"
+    abs_path = "/work/sub/cache/compresr/tool-output/abc123"
     rewritten, _, _ = recover.rewrite_placeholders(abs_path, ORIGINAL, compressed)
     assert f"{abs_path} L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
@@ -145,7 +169,7 @@ def test_reference_uses_given_absolute_path():
 def test_reference_never_matches_drop_marker():
     """Our own 'omitted' reference must not be re-detected as a drop marker by
     EITHER the general signal regex or the broadened counted-marker regex."""
-    ref = recover.build_reference(".compresr/cache/x", recover.Gap(0, 4, 5))
+    ref = recover.build_reference(_cache_path("x"), recover.Gap(0, 4, 5))
     assert recover._drop_marker_re.search(ref) is None
     assert recover._placeholder_re.search(ref) is None
 
@@ -165,7 +189,7 @@ def test_ambiguous_repeated_anchor_fails_open():
     )
     compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/ambiguous", original, compressed
+        _cache_path("ambiguous"), original, compressed
     )
     assert not ok
     assert gaps == []
@@ -177,12 +201,12 @@ def test_anchor_accepts_repeated_line_that_is_unique_after_cursor():
     compressed = "\n".join(["keep", "same", "tail"])
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/repeated-after-cursor", original, compressed
+        _cache_path("repeated-after-cursor"), original, compressed
     )
 
     assert ok
     assert [(g.start, g.end, g.count) for g in gaps] == [(0, 0, 1)]
-    assert ".compresr/cache/repeated-after-cursor L0-0" in rewritten
+    assert f"{CACHE_ROOT}/repeated-after-cursor L0-0" in rewritten
 
 
 def test_strict_marker_fallback_handles_repeated_kept_lines():
@@ -192,12 +216,12 @@ def test_strict_marker_fallback_handles_repeated_kept_lines():
     compressed = "\n".join(["header", "repeat", "[2 lines removed]", "repeat", "footer"])
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/repeated-strict", original, compressed
+        _cache_path("repeated-strict"), original, compressed
     )
 
     assert ok
     assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
-    assert ".compresr/cache/repeated-strict L2-3" in rewritten
+    assert f"{CACHE_ROOT}/repeated-strict L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
 
 
@@ -208,12 +232,12 @@ def test_strict_marker_fallback_extends_bad_count_to_next_anchor():
     compressed = "\n".join(["header", "repeat", "[1 lines removed]", "repeat", "footer"])
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/bad-count", original, compressed
+        _cache_path("bad-count"), original, compressed
     )
 
     assert ok
     assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
-    assert ".compresr/cache/bad-count L2-3" in rewritten
+    assert f"{CACHE_ROOT}/bad-count L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
 
 
@@ -227,7 +251,7 @@ def test_inline_token_marker_anchors_and_does_not_leak():
     compressed = "a one\nb two[3 tokens dropped]"
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/inline", original, compressed
+        _cache_path("inline"), original, compressed
     )
 
     assert ok
@@ -251,7 +275,7 @@ def test_midline_marker_hybrid_is_dropped_not_corrupting():
     ])
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/hybrid", original, compressed
+        _cache_path("hybrid"), original, compressed
     )
 
     assert ok
@@ -275,12 +299,12 @@ def test_strict_marker_fallback_handles_token_markers():
     )
 
     rewritten, gaps, ok = recover.rewrite_placeholders(
-        ".compresr/cache/token-strict", original, compressed
+        _cache_path("token-strict"), original, compressed
     )
 
     assert ok
     assert [(g.start, g.end, g.count) for g in gaps] == [(2, 3, 2)]
-    assert ".compresr/cache/token-strict L2-3" in rewritten
+    assert f"{CACHE_ROOT}/token-strict L2-3" in rewritten
     assert "Read(offset=3,limit=2)" in rewritten
 
 
@@ -305,7 +329,7 @@ def test_multiple_inline_token_markers_emit_exact_read_ranges():
             "footer",
         ]
     )
-    cache_path = ".compresr/cache/multi-inline"
+    cache_path = _cache_path("multi-inline")
 
     rewritten, gaps, ok = recover.rewrite_placeholders(cache_path, original, compressed)
 
@@ -327,13 +351,12 @@ def test_hook_compresses_large_output(monkeypatch):
 
     c = ToolOutputCompressor()
     c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
-    # The cache write goes through Hermes's file-ops backend; capture it here so
-    # the test doesn't spin up a real environment.
+    # Capture the write path so the test stays local and deterministic.
     stored = {}
     monkeypatch.setattr(
         cache, "store_original",
         lambda cid, content, task_id="default", **_: stored.update({cid: content})
-        or cache.relative_cache_path(cid),
+        or _cache_path(cid),
     )
     # Mock the API: pretend it kept the first 2 lines and dropped the rest.
     monkeypatch.setattr(
@@ -346,9 +369,86 @@ def test_hook_compresses_large_output(monkeypatch):
     )
     assert out is not None
     assert "[compresr:" in out
+    assert CACHE_ROOT in out
+    assert ".compresr/cache" not in out
     # The EXACT text the API compressed was persisted so the reference resolves.
     cache_id = c._cache_id(ORIGINAL)
     assert cache_id in stored
+
+
+def test_store_original_writes_host_cache_and_returns_visible_path(monkeypatch, tmp_path):
+    from plugins.tool_output_compresr import cache
+
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: _fake_env("DockerEnvironment"))
+
+    path = cache.store_original("abc123", ORIGINAL, task_id="task-cache", max_cache_mb=0)
+
+    assert path == f"{CACHE_ROOT}/abc123"
+    host_file = hermes_home / "cache" / "compresr" / "tool-output" / "abc123"
+    assert host_file.read_text(encoding="utf-8") == ORIGINAL
+
+
+def test_store_original_fails_open_when_visibility_unknown(monkeypatch, tmp_path):
+    from plugins.tool_output_compresr import cache
+
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        cache,
+        "_get_active_env",
+        lambda task_id: _fake_env("SingularityEnvironment"),
+    )
+
+    assert cache.store_original("no-visible-path", ORIGINAL, task_id="task-cache", max_cache_mb=0) is None
+    assert not (hermes_home / "cache" / "compresr" / "tool-output" / "no-visible-path").exists()
+
+
+def test_store_original_with_no_active_env_uses_host_path(monkeypatch, tmp_path):
+    from plugins.tool_output_compresr import cache
+
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: None)
+
+    path = cache.store_original("host-path", ORIGINAL, task_id="task-cache", max_cache_mb=0)
+
+    assert path == str(hermes_home / "cache" / "compresr" / "tool-output" / "host-path")
+    assert (hermes_home / "cache" / "compresr" / "tool-output" / "host-path").exists()
+
+
+def test_store_original_force_syncs_remote_cache_before_return(monkeypatch, tmp_path):
+    from plugins.tool_output_compresr import cache
+
+    hermes_home = tmp_path / ".hermes"
+    sync_manager = _FakeSyncManager()
+    env = _fake_env("SSHEnvironment", _remote_home="/home/agent", _sync_manager=sync_manager)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: env)
+
+    path = cache.store_original("synced", ORIGINAL, task_id="task-sync", max_cache_mb=0)
+
+    assert sync_manager.calls == [True]
+    assert path == "/home/agent/.hermes/cache/compresr/tool-output/synced"
+    assert (hermes_home / "cache" / "compresr" / "tool-output" / "synced").exists()
+
+
+def test_store_original_force_sync_failure_deletes_host_file(monkeypatch, tmp_path):
+    from plugins.tool_output_compresr import cache
+
+    hermes_home = tmp_path / ".hermes"
+    sync_manager = _FakeSyncManager(boom=RuntimeError("sync failed"))
+    env = _fake_env("SSHEnvironment", _remote_home="/home/agent", _sync_manager=sync_manager)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: env)
+
+    assert cache.store_original("sync-fail", ORIGINAL, task_id="task-sync", max_cache_mb=0) is None
+    assert sync_manager.calls == [True]
+    assert not (hermes_home / "cache" / "compresr" / "tool-output" / "sync-fail").exists()
 
 
 def test_hook_rewrites_inline_token_markers_to_recovery_refs(monkeypatch):
@@ -373,7 +473,7 @@ def test_hook_rewrites_inline_token_markers_to_recovery_refs(monkeypatch):
             "footer complete",
         ]
     )
-    cache_path = ".compresr/cache/inline-hook"
+    cache_path = _cache_path("inline-hook")
     stored = {}
 
     def store_original(cid, content, task_id="default", **_):
@@ -401,6 +501,7 @@ def test_hook_rewrites_inline_token_markers_to_recovery_refs(monkeypatch):
     assert "tokens dropped" not in out
     assert f"{cache_path} L2-4" in out
     assert "Read(offset=3,limit=3)" in out
+    assert ".compresr/cache" not in out
     assert stored[c._cache_id(original)] == (original, "task-inline")
 
 
@@ -451,7 +552,7 @@ def test_hook_failopen_when_no_recovery_reference(monkeypatch):
     monkeypatch.setattr(
         cache,
         "store_original",
-        lambda cid, content, task_id="default", **_: cache.relative_cache_path(cid),
+        lambda cid, content, task_id="default", **_: _cache_path(cid),
     )
     monkeypatch.setattr(
         c._client,
@@ -485,7 +586,7 @@ def test_hook_failopen_on_ambiguous_recovery(monkeypatch):
     monkeypatch.setattr(
         cache,
         "store_original",
-        lambda cid, content, task_id="default", **_: cache.relative_cache_path(cid),
+        lambda cid, content, task_id="default", **_: _cache_path(cid),
     )
     monkeypatch.setattr(
         c._client,
@@ -555,7 +656,7 @@ def test_backend_cache_prune_disabled_leaves_files(tmp_path):
     assert current.exists()
 
 
-def test_backend_cache_prune_without_exec_does_not_touch_local_path(tmp_path):
+def test_backend_cache_prune_without_exec_still_prunes_host_root(tmp_path):
     from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
 
     old = tmp_path / "old"
@@ -565,7 +666,7 @@ def test_backend_cache_prune_without_exec_does_not_touch_local_path(tmp_path):
 
     _prune_cache_dir_via_backend(object(), str(tmp_path), 1, str(current))
 
-    assert old.exists()
+    assert not old.exists()
     assert current.exists()
 
 

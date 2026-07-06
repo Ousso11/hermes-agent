@@ -1,112 +1,181 @@
 """Persist original tool outputs so recovery references resolve.
 
-The addressable references emitted by :mod:`recover` point at
-``.compresr/cache/<id>``. We persist each original there through Hermes's own
-file-operations layer (``_get_file_ops(task_id).write_file``) — the SAME backend
-the agent's ``read_file``/``write_file`` tools use — rather than touching the
-local filesystem directly.
-
-That matters for correctness, not just tidiness: when the agent runs in a
-non-local environment (docker/modal sandbox, remote terminal), the cache write
-lands in that same environment and resolves through the same per-task cwd, so the
-reference the model later ``read_file``s is guaranteed to point at the file we
-wrote. A direct local-disk write would silently miss the sandbox.
+The canonical cache lives under ``HERMES_HOME/cache/compresr/tool-output``.
+We write originals there on the host, then translate the path to an
+agent-visible location only when the active backend can prove one. If that
+authority cannot be established, callers fail open instead of emitting a
+recovery reference that points at something the agent cannot read.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import Optional, Set
-
-from .recover import CACHE_DIR_NAME
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ``.compresr`` — the parent of the cache dir; carries a self-ignoring .gitignore.
-_CACHE_ROOT = CACHE_DIR_NAME.split("/")[0]
+_CACHE_SUBDIR = Path("cache") / "compresr" / "tool-output"
 
-# Tasks for which we've already dropped the ignore file (write it at most once).
-_gitignore_done: Set[str] = set()
+
+def get_cache_root() -> Path:
+    """Return the host-side cache root for compressed tool outputs."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / _CACHE_SUBDIR
+
+
+def ensure_cache_root() -> Path:
+    """Create the cache root with restrictive permissions if needed."""
+    root = get_cache_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def cache_file_path(cache_id: str) -> Path:
+    """Return the host-side file path for *cache_id*."""
+    return get_cache_root() / cache_id
 
 
 def relative_cache_path(cache_id: str) -> str:
-    """Workspace-relative path the recovery reference points at."""
-    return f"{CACHE_DIR_NAME}/{cache_id}"
+    """Return the canonical host-side cache path for *cache_id*."""
+    return str(cache_file_path(cache_id))
+
+
+def _get_active_env(task_id: str):
+    try:
+        from tools.terminal_tool import get_active_env as _get
+
+        return _get(task_id)
+    except Exception:
+        return None
+
+
+def _agent_visible_cache_path(cache_path: Path, task_id: str) -> Optional[str]:
+    """Translate *cache_path* to the path the active backend can read.
+
+    Local backends can read the host path directly. Non-local backends need a
+    concrete mounted/synced path. If we cannot establish that path, return
+    ``None`` so the caller can fail open.
+    """
+    active_env = _get_active_env(task_id)
+
+    if active_env is not None:
+        env_name = active_env.__class__.__name__
+        if env_name == "LocalEnvironment":
+            try:
+                return str(cache_path.resolve())
+            except OSError:
+                return str(cache_path)
+        if env_name == "SingularityEnvironment" or "singularity" in env_name.lower():
+            return None
+
+        remote_home = getattr(active_env, "_remote_home", None)
+        if isinstance(remote_home, str) and remote_home.strip():
+            container_base = f"{remote_home.rstrip('/')}/.hermes"
+        elif env_name in {"DockerEnvironment", "ModalEnvironment"}:
+            container_base = "/root/.hermes"
+        else:
+            return None
+    else:
+        backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower() or "local"
+        if backend == "local":
+            try:
+                return str(cache_path.resolve())
+            except OSError:
+                return str(cache_path)
+        if backend in {"docker", "modal"}:
+            container_base = "/root/.hermes"
+        else:
+            return None
+
+    try:
+        from tools.credential_files import map_cache_path_to_container
+
+        return map_cache_path_to_container(str(cache_path), container_base=container_base)
+    except Exception as e:  # pragma: no cover - translation is best effort
+        logger.debug("tool_output_compresr: cache path mapping failed: %s", e)
+        return None
+
+
+def _force_sync_visible_cache(cache_path: Path, task_id: str) -> bool:
+    """Best-effort force sync for backends that stage files into a remote FS."""
+    active_env = _get_active_env(task_id)
+    if active_env is None:
+        return True
+
+    env_name = active_env.__class__.__name__
+    if env_name == "LocalEnvironment":
+        return True
+    if env_name == "SingularityEnvironment" or "singularity" in env_name.lower():
+        return True
+
+    sync_manager = None
+    for attr in ("_sync_manager", "sync_manager", "_file_sync_manager"):
+        candidate = getattr(active_env, attr, None)
+        if candidate is not None and callable(getattr(candidate, "sync", None)):
+            sync_manager = candidate
+            break
+    if sync_manager is None:
+        return True
+
+    try:
+        sync_manager.sync(force=True)
+        return True
+    except Exception as e:
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logger.warning(
+            "tool_output_compresr: force sync failed for %s: %s", cache_path, e
+        )
+        return False
 
 
 def _prune_cache_dir_via_backend(
-    file_ops: object,
+    _file_ops: object | None,
     cache_dir: str,
     max_bytes: int,
     keep_path: str,
 ) -> None:
-    """Prune in the same backend that owns the cached files."""
+    """Best-effort prune of the host-side cache root."""
     if max_bytes <= 0:
         return
-    exec_fn = getattr(file_ops, "_exec", None)
-    escape = getattr(file_ops, "_escape_shell_arg", None)
-    if not callable(exec_fn) or not callable(escape):
-        logger.debug(
-            "tool_output_compresr: skipping backend cache prune for %s; "
-            "file_ops has no shell execution helpers",
-            cache_dir,
-        )
-        return
-
-    snippet = """
-import pathlib
-import sys
-import traceback
-
-try:
-    cache_dir = pathlib.Path(sys.argv[1])
-    max_bytes = int(sys.argv[2])
-    keep_path = pathlib.Path(sys.argv[3]).resolve()
-    entries = []
-    total = 0
-    for path in cache_dir.iterdir():
-        if not path.is_file():
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        size = int(stat.st_size)
-        total += size
-        entries.append((float(stat.st_mtime), str(path), size))
-    if total <= max_bytes:
-        raise SystemExit(0)
-    for _, path_str, size in sorted(entries):
-        path = pathlib.Path(path_str)
-        try:
-            if path.resolve() == keep_path:
+    root = Path(cache_dir)
+    keep = Path(keep_path)
+    try:
+        entries = []
+        total = 0
+        for path in root.iterdir():
+            if not path.is_file():
                 continue
-            path.unlink()
-            total -= size
-        except OSError:
-            continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            size = int(stat.st_size)
+            total += size
+            entries.append((float(stat.st_mtime), path, size))
         if total <= max_bytes:
-            break
-except Exception:
-    traceback.print_exc()
-    raise SystemExit(1)
-"""
-    last_result = None
-    for python_cmd in ("python3", "python"):
-        command = (
-            f"{python_cmd} -c {escape(snippet)} "
-            f"{escape(cache_dir)} {escape(str(max_bytes))} {escape(keep_path)}"
-        )
-        result = exec_fn(command, timeout=30)
-        if getattr(result, "exit_code", None) == 0:
             return
-        last_result = result
-    logger.debug(
-        "tool_output_compresr: backend cache prune failed for %s: %s",
-        cache_dir,
-        getattr(last_result, "stdout", "") if last_result is not None else "",
-    )
+        for _, path, size in sorted(entries):
+            try:
+                if path.resolve() == keep.resolve():
+                    continue
+                path.unlink()
+                total -= size
+            except OSError:
+                continue
+            if total <= max_bytes:
+                break
+    except Exception as e:  # pragma: no cover - pruning must never break recovery
+        logger.debug("tool_output_compresr: cache prune failed for %s: %s", cache_dir, e)
 
 def store_original(
     cache_id: str,
@@ -114,44 +183,45 @@ def store_original(
     task_id: str = "default",
     max_cache_mb: int = 256,
 ) -> Optional[str]:
-    """Persist ``content`` under ``cache_id`` via Hermes's file-ops backend.
+    """Persist ``content`` under ``cache_id`` on the host cache root.
 
-    Returns the ABSOLUTE path written, or ``None`` if the write failed. We resolve
-    to an absolute path (against the task's cwd at write time) so the recovery
-    reference survives a later ``cd``: Hermes resolves *relative* read paths against
-    the live terminal cwd, which moves, but an absolute path does not. On write
-    failure we return ``None`` so the caller fails open instead of emitting a
-    reference to a file that was never written.
+    Returns an agent-visible path when one can be proven, or ``None`` if the
+    write or path translation failed. Callers must fail open on ``None``.
     """
-    from tools.file_tools import _get_file_ops, _resolve_path_for_task
-
-    ops = _get_file_ops(task_id)
-    rel = relative_cache_path(cache_id)
-
-    # Keep the cache out of the user's VCS regardless of their workspace.
-    if task_id not in _gitignore_done:
+    root = ensure_cache_root()
+    cache_path = root / cache_id
+    try:
+        cache_path.write_text(content, encoding="utf-8")
         try:
-            ops.write_file(f"{_CACHE_ROOT}/.gitignore", "*\n")
-            _gitignore_done.add(task_id)
-        except Exception as e:  # pragma: no cover - cosmetic, never fatal
-            logger.debug("tool_output_compresr: could not write cache .gitignore: %s", e)
-
-    try:
-        ops.write_file(rel, content)
+            os.chmod(cache_path, 0o600)
+        except OSError:
+            pass
     except Exception as e:
-        logger.warning("tool_output_compresr: cache write failed for %s: %s", rel, e)
+        logger.warning("tool_output_compresr: cache write failed for %s: %s", cache_path, e)
         return None
-    try:
-        resolved = _resolve_path_for_task(rel, task_id)
-    except Exception:  # pragma: no cover - resolver is defensive; fall back to rel
-        return rel
+
+    if not _force_sync_visible_cache(cache_path, task_id):
+        return None
+
+    visible_path = _agent_visible_cache_path(cache_path, task_id)
+    if visible_path is None:
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logger.warning(
+            "tool_output_compresr: cache path not visible to the active backend: %s",
+            cache_path,
+        )
+        return None
+
     try:
         _prune_cache_dir_via_backend(
-            ops,
-            str(Path(resolved).parent),
+            None,
+            str(root),
             max(0, int(max_cache_mb)) * 1024 * 1024,
-            str(resolved),
+            str(cache_path),
         )
     except Exception as e:  # pragma: no cover - pruning must never break recovery
         logger.debug("tool_output_compresr: cache prune failed: %s", e)
-    return str(resolved)
+    return visible_path

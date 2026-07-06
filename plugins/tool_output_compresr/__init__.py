@@ -2,10 +2,10 @@
 
 Compresses large tool outputs (verbose ``grep``/``read_file``/``execute_code``
 dumps) *as they arrive*, on the ``transform_tool_result`` hook — before they
-bloat the context window — using Compresr's query-specific tool-output API. Every
-dropped span is rewritten into an ADDRESSABLE recovery reference so the agent can
-``read_file(offset, limit)``/``grep`` the cached original back. Lossless by
-recovery; never a query-blind truncator.
+bloat the context window — using Compresr's query-specific tool-output API.
+Every dropped span is rewritten into an ADDRESSABLE recovery reference so the
+agent can ``read_file(offset, limit)``/``grep`` the cached original back.
+Lossless by recovery; never a query-blind truncator.
 
 This is the per-turn complement to ``plugins/context_engine/compresr`` (which
 compresses at compaction time). The two compose: this is a pre-filter that
@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 
+from . import cache
 from .client import CompresrToolOutputClient, DEFAULT_TOOL_OUTPUT_MODEL
 from .compress import compress_tool_output, count_tokens
 
@@ -320,6 +321,10 @@ class ToolOutputCompressor:
 
 def register(ctx: Any) -> None:
     """Plugin entry point — called by the Hermes plugin loader."""
+    try:
+        cache.ensure_cache_root()
+    except Exception as e:
+        logger.warning("tool_output_compresr: could not initialize cache root: %s", e)
     compressor = ToolOutputCompressor()
     ctx.register_hook("transform_tool_result", compressor.on_transform_tool_result)
     if not compressor.api_key:

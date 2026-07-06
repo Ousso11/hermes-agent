@@ -1,9 +1,9 @@
 """Tool-output compression for Hermes — one lean path.
 
 Above the size threshold (enforced by the caller via ``min_tokens``) we ALWAYS
-call the Compresr API, persist the original tool output to the workspace cache,
-and rewrite the API's inline placeholders into addressable ``.compresr/cache``
-references the agent can ``Read``/``Grep`` back. Lossless by recovery.
+call the Compresr API, persist the original tool output to Hermes's managed
+cache, and rewrite the API's inline placeholders into addressable references the
+agent can ``Read``/``Grep`` back. Lossless by recovery.
 
 Fail-open: any API error returns the original content unchanged.
 
@@ -59,10 +59,10 @@ def compress_tool_output(
         info["out_tokens"] = base_tok
         return content, info
 
-    # Persist the EXACT text the API compressed so anchored references resolve,
-    # and reference it by ABSOLUTE path so recovery survives a later `cd`. If the
-    # write failed we get None back and fail open to the original tool output
-    # rather than emit references to a file that was never written.
+    # Persist the EXACT text the API compressed so anchored references resolve.
+    # If the cache write or backend visibility check fails, return None and
+    # fail open to the original tool output rather than emit references to a
+    # file the agent cannot read.
     cache_path = cache.store_original(cache_id, content, task_id, max_cache_mb=max_cache_mb)
     if cache_path is None:
         info["error"] = "cache write failed"

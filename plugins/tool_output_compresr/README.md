@@ -12,17 +12,16 @@ Crucially, it is **lossless by recovery**: every dropped span is rewritten into
 an addressable reference the agent can recover with its native tools:
 
 ```
-[compresr: 12 lines omitted · .compresr/cache/a3f9c1 L40-51 · Read(offset=41,limit=12) or Grep to recover]
+[compresr: 12 lines omitted · /root/.hermes/cache/compresr/tool-output/a3f9c1 L40-51 · Read(offset=41,limit=12) or Grep to recover]
 ```
 
-The original output is cached verbatim under `<workspace>/.compresr/cache/<id>`,
-so the reference resolves to a real file. The cache is written through Hermes's
-own file-operations backend (`_get_file_ops(task_id).write_file`) — the same
-layer the agent's `write_file`/`read_file` tools use — so the path is resolved
-identically to how the agent later reads it, and the write lands in the right
-place even when the agent runs in a docker/modal sandbox. The model recovers the
-whole thing — or just a slice — on demand. Nothing the agent might need is ever
-more than one `Read` away.
+The original output is cached verbatim under
+`~/.hermes/cache/compresr/tool-output/<id>` on the host. When the active backend
+can prove an agent-visible path, the recovery reference points at that mounted
+or synced location instead. If that path cannot be guaranteed, the plugin fails
+open and leaves the original output untouched. The model recovers the whole
+thing - or just a slice - on demand, as long as the cached original is still
+retained.
 
 ## How it works — one path
 
@@ -30,7 +29,7 @@ more than one `Read` away.
 1. Below the threshold (min_tokens)? → return None, original output unchanged.
 2. Above it → ALWAYS call the Compresr tool-output API (toc_latte_v2, coarse)
    with the tool's intent as the query.
-3. Persist the original to .compresr/cache/<id>, then rewrite the API's drop
+3. Persist the original to Hermes's managed cache, then rewrite the API's drop
    markers into addressable references by anchoring verbatim kept lines.
 ```
 
@@ -82,14 +81,15 @@ Or run `hermes setup` and choose **Compresr** for the compression engine.
 | `COMPRESR_TOOL_OUTPUT_MODEL` / `tool_output_model` | `toc_latte_v2` | model (tool-output endpoint only accepts `toc_*` models) |
 | `COMPRESR_TOOL_OUTPUT_MIN_TOKENS` / `tool_output_min_tokens` | `1500` | skip smaller outputs |
 | `COMPRESR_TOOL_OUTPUT_TIMEOUT` / `tool_output_timeout` | `30` | request timeout (s) |
-| `COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB` / `tool_output_max_cache_mb` | `256` | best-effort `.compresr/cache` cap; `0` disables pruning |
+| `COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB` / `tool_output_max_cache_mb` | `256` | best-effort Hermes cache cap; `0` disables pruning |
 
 The cache cap is a disk-usage guard, not a retention guarantee. Old cached
-originals can be pruned after enough later compressed outputs are written in the
-same workspace, so a very old resumed session may contain a recovery reference
-whose backing cache file has since been evicted. Set `tool_output_max_cache_mb:
-0` if preserving historical recovery references across long-lived resumed
-sessions matters more than bounding `.compresr/cache` growth.
+originals can be pruned after enough later compressed outputs are written into
+the profile's shared Hermes cache, so a very old resumed session may contain a
+recovery reference whose backing cache file has since been evicted. Set
+`tool_output_max_cache_mb: 0` if preserving historical recovery references
+across long-lived resumed sessions matters more than bounding profile cache
+growth.
 
 ## Tests
 
