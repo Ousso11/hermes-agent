@@ -1,0 +1,384 @@
+"""Tests for the tool_output_compresr plugin.
+
+The plugin compresses large tool outputs via the Compresr API, caches the
+verbatim original under Hermes's managed cache (PR #6 cache-authority: host write
++ per-backend agent-visible path), and passes the API's compressed text through
+UNCHANGED with a footer pointing the agent at the original (recoverable with
+``read_file``/``search_files``). These cover the footer/pointer contract, the
+transform hook's gating and fail-open behavior, the cache-authority path
+translation, and size-based retention.
+"""
+
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import json  # noqa: E402
+
+from plugins.tool_output_compresr import ToolOutputCompressor  # noqa: E402
+from plugins.tool_output_compresr import cache, compress  # noqa: E402
+
+ORIGINAL = "\n".join(
+    [
+        "line0 alpha",
+        "line1 bravo",
+        "line2 charlie",
+        "line3 delta",
+        "line4 echo",
+        "line5 foxtrot",
+    ]
+)
+
+# A short stand-in for the API's compressed output. Keeps a couple of lines and
+# an inline drop marker, which the plugin now passes through verbatim.
+COMPRESSED = "line0 alpha\nline1 bravo\n[4 lines removed]"
+
+CACHE_ROOT = "/root/.hermes/cache/compresr/tool-output"
+
+
+def _cache_path(cache_id: str) -> str:
+    return f"{CACHE_ROOT}/{cache_id}"
+
+
+def _fake_env(name: str, **attrs):
+    env = type(name, (), {})()
+    for key, value in attrs.items():
+        setattr(env, key, value)
+    return env
+
+
+class _FakeSyncManager:
+    def __init__(self, boom: Exception | None = None):
+        self.calls = []
+        self.boom = boom
+
+    def sync(self, force=False):
+        self.calls.append(force)
+        if self.boom is not None:
+            raise self.boom
+
+
+def _shell_file_ops_for_tmp_path(tmp_path):
+    from tools.file_operations import ShellFileOperations
+
+    class LocalEnv:
+        cwd = str(tmp_path)
+
+        def execute(self, command, cwd=None, timeout=None, stdin_data=None):
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd or self.cwd,
+                input=stdin_data,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            return {
+                "output": (result.stdout or "") + (result.stderr or ""),
+                "returncode": result.returncode,
+            }
+
+    return ShellFileOperations(LocalEnv(), cwd=str(tmp_path))
+
+
+# --------------------------------------------------------------------------- #
+# compress_tool_output: footer contract + fail-open
+# --------------------------------------------------------------------------- #
+class _FakeClient:
+    def __init__(self, out=COMPRESSED, stats=None, boom=False):
+        self.out, self.stats, self.boom = out, stats or {}, boom
+
+    def compress(self, **kw):
+        if self.boom:
+            raise RuntimeError("HTTP 500")
+        return self.out, self.stats
+
+
+def test_compress_appends_footer_with_cache_pointer(monkeypatch):
+    monkeypatch.setattr(cache, "store_original", lambda cid, content, task_id="default", **_: _cache_path(cid))
+    out, info = compress.compress_tool_output(
+        query="q", content=ORIGINAL, tool_name="grep",
+        cache_id="abc", client=_FakeClient(), task_id="t",
+    )
+    assert info["shortened"] is True
+    assert out.startswith(COMPRESSED)                 # API output verbatim
+    assert "[4 lines removed]" in out                 # marker preserved, not rewritten
+    assert compress.FOOTER_MARKER in out
+    assert info["cache_path"] in out                  # pointer names the cache path
+    assert "read_file" in out and "search_files" in out
+
+
+def test_compress_failopen_on_api_error():
+    out, info = compress.compress_tool_output(
+        query="q", content=ORIGINAL, tool_name="grep", cache_id="c",
+        client=_FakeClient(boom=True), task_id="t",
+    )
+    assert out == ORIGINAL
+    assert info["called_api"] is False and info["shortened"] is False
+
+
+def test_compress_failopen_when_not_shorter():
+    out, info = compress.compress_tool_output(
+        query="q", content=ORIGINAL, tool_name="grep", cache_id="c",
+        client=_FakeClient(out=ORIGINAL + "\nplus more padding text here"),
+        task_id="t",
+    )
+    assert out == ORIGINAL
+    assert info["called_api"] is True and info["shortened"] is False
+
+
+def test_compress_failopen_on_cache_write_failure(monkeypatch):
+    monkeypatch.setattr(cache, "store_original", lambda *a, **k: None)
+    out, info = compress.compress_tool_output(
+        query="q", content=ORIGINAL, tool_name="grep", cache_id="c",
+        client=_FakeClient(), task_id="t",
+    )
+    assert out == ORIGINAL
+    assert info["shortened"] is False and info["error"] == "cache write failed"
+
+
+# --------------------------------------------------------------------------- #
+# transform_tool_result hook
+# --------------------------------------------------------------------------- #
+def test_hook_skips_small_output():
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key = True, "cmp_test"
+    assert c.on_transform_tool_result(tool_name="grep", args={}, result="tiny") is None
+
+
+def test_hook_compresses_large_output(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    stored = {}
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: stored.update({cid: content}) or _cache_path(cid),
+    )
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "line"}, result=ORIGINAL, tool_call_id="tc1"
+    )
+    assert out is not None
+    assert compress.FOOTER_MARKER in out
+    assert out.startswith(COMPRESSED)                 # API markers preserved
+    assert CACHE_ROOT in out                          # pointer present
+    assert ".compresr/cache" not in out               # not the old workspace path
+    assert c._cache_id(ORIGINAL) in stored
+
+
+def test_hook_folds_footer_into_json_envelope(monkeypatch):
+    """For unwrappable JSON tools, the footer must land inside the inner payload
+    so the returned result stays valid JSON."""
+    result = json.dumps({"content": ORIGINAL, "path": "/x"})
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: _cache_path(cid),
+    )
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    out = c.on_transform_tool_result(
+        tool_name="read_file", args={"file_path": "/x"}, result=result,
+        task_id="t", tool_call_id="tc2",
+    )
+    assert out is not None
+    parsed = json.loads(out)                           # still valid JSON
+    assert compress.FOOTER_MARKER in parsed["content"]
+    assert parsed["path"] == "/x"                       # sibling fields preserved
+
+
+def test_hook_skips_already_compressed(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    already = "some output\n" + compress.FOOTER_MARKER + " ... cached at /x"
+    assert c.on_transform_tool_result(tool_name="grep", args={}, result=already) is None
+
+
+def test_hook_failopen_on_api_error(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+
+    def _boom(**kw):
+        raise RuntimeError("HTTP 500")
+
+    monkeypatch.setattr(c._client, "compress", _boom)
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc3"
+    )
+    assert out is None
+
+
+def test_hook_failopen_on_cache_write_failure(monkeypatch):
+    """If persisting the original fails, the pointer would dangle — the hook must
+    fail open to the original output rather than emit it."""
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(cache, "store_original", lambda *a, **k: None)
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc4"
+    )
+    assert out is None
+
+
+def test_hook_failopen_when_not_shorter(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(cache, "store_original", lambda *a, **k: _cache_path("c"))
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (ORIGINAL + "\nlonger now", {}))
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc5"
+    )
+    assert out is None
+
+
+# --------------------------------------------------------------------------- #
+# Cache-authority (PR #6): host write + per-backend agent-visible path
+# --------------------------------------------------------------------------- #
+def test_store_original_writes_host_cache_and_returns_visible_path(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: _fake_env("DockerEnvironment"))
+
+    path = cache.store_original("abc123", ORIGINAL, task_id="task-cache", max_cache_mb=0)
+
+    assert path == f"{CACHE_ROOT}/abc123"
+    host_file = hermes_home / "cache" / "compresr" / "tool-output" / "abc123"
+    assert host_file.read_text(encoding="utf-8") == ORIGINAL
+
+
+def test_store_original_fails_open_when_visibility_unknown(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: _fake_env("SingularityEnvironment"))
+
+    assert cache.store_original("no-visible-path", ORIGINAL, task_id="task-cache", max_cache_mb=0) is None
+    assert not (hermes_home / "cache" / "compresr" / "tool-output" / "no-visible-path").exists()
+
+
+def test_store_original_with_no_active_env_uses_host_path(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: None)
+
+    path = cache.store_original("host-path", ORIGINAL, task_id="task-cache", max_cache_mb=0)
+
+    assert path == str(hermes_home / "cache" / "compresr" / "tool-output" / "host-path")
+    assert (hermes_home / "cache" / "compresr" / "tool-output" / "host-path").exists()
+
+
+def test_store_original_force_syncs_remote_cache_before_return(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    sync_manager = _FakeSyncManager()
+    env = _fake_env("SSHEnvironment", _remote_home="/home/agent", _sync_manager=sync_manager)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: env)
+
+    path = cache.store_original("synced", ORIGINAL, task_id="task-sync", max_cache_mb=0)
+
+    assert sync_manager.calls == [True]
+    assert path == "/home/agent/.hermes/cache/compresr/tool-output/synced"
+    assert (hermes_home / "cache" / "compresr" / "tool-output" / "synced").exists()
+
+
+def test_store_original_force_sync_failure_deletes_host_file(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    sync_manager = _FakeSyncManager(boom=RuntimeError("sync failed"))
+    env = _fake_env("SSHEnvironment", _remote_home="/home/agent", _sync_manager=sync_manager)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: env)
+
+    assert cache.store_original("sync-fail", ORIGINAL, task_id="task-sync", max_cache_mb=0) is None
+    assert sync_manager.calls == [True]
+    assert not (hermes_home / "cache" / "compresr" / "tool-output" / "sync-fail").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Retention (size-based prune)
+# --------------------------------------------------------------------------- #
+def test_backend_cache_prune_uses_backend_exec(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    newer = tmp_path / "newer"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    newer.write_text("y" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+    os.utime(old, (1, 1))
+    os.utime(newer, (2, 2))
+    os.utime(current, (3, 3))
+
+    file_ops = _shell_file_ops_for_tmp_path(tmp_path)
+    _prune_cache_dir_via_backend(file_ops, str(tmp_path), 20, str(current))
+
+    assert not old.exists()
+    assert newer.exists()
+    assert current.exists()
+    assert sum(path.stat().st_size for path in tmp_path.iterdir() if path.is_file()) <= 20
+
+
+def test_backend_cache_prune_disabled_leaves_files(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+
+    file_ops = _shell_file_ops_for_tmp_path(tmp_path)
+    _prune_cache_dir_via_backend(file_ops, str(tmp_path), 0, str(current))
+
+    assert old.exists()
+    assert current.exists()
+
+
+def test_backend_cache_prune_without_exec_still_prunes_host_root(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    current = tmp_path / "current"
+    old.write_text("x" * 10, encoding="utf-8")
+    current.write_text("z" * 10, encoding="utf-8")
+
+    _prune_cache_dir_via_backend(object(), str(tmp_path), 1, str(current))
+
+    assert not old.exists()
+    assert current.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+def test_tool_output_api_key_is_env_only(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMPRESR_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compresr:\n"
+        "  api_key: cmp_from_config\n"
+        "  tool_output_enabled: true\n"
+        "  tool_output_min_tokens: 7\n"
+        "  tool_output_max_cache_mb: 3\n",
+        encoding="utf-8",
+    )
+
+    c = ToolOutputCompressor()
+    assert c.api_key == ""            # secrets are env-only
+    assert c.enabled is True
+    assert c.min_tokens == 7
+    assert c.max_cache_mb == 3
+    assert not c.active               # no key → inactive
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

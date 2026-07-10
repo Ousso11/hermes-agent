@@ -9623,6 +9623,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
 
 
+    def _compresr_usage_lines(self):
+        """Compresr ROI lines for /usage; empty when the integration is inactive.
+
+        Reads compaction-engine counters off the live ``context_compressor`` and
+        per-turn counters off the registered ``transform_tool_result`` hook
+        instance. Fully defensive — /usage must never break if a plugin's shape
+        changes or the plugins aren't loaded.
+        """
+        lines = []
+        try:
+            eng = getattr(self.agent, "context_compressor", None)
+            calls = getattr(eng, "compresr_calls", 0) or 0
+            if calls:
+                saved = getattr(eng, "compresr_tokens_saved", 0) or 0
+                errs = getattr(eng, "compresr_errors", 0) or 0
+                suffix = f" · {errs} err" if errs else ""
+                lines.append(f"  Compresr (compaction):  {calls} calls · {saved:,} tok saved{suffix}")
+        except Exception:
+            pass
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            for cb in get_plugin_manager()._hooks.get("transform_tool_result", []):
+                inst = getattr(cb, "__self__", None)
+                st = inst.get_status() if hasattr(inst, "get_status") else None
+                if st and st.get("plugin") == "tool_output_compresr" and st.get("calls"):
+                    errs = st.get("errors", 0) or 0
+                    suffix = f" · {errs} err" if errs else ""
+                    lines.append(
+                        f"  Compresr (tool output): {st['calls']} calls · "
+                        f"{st.get('tokens_saved', 0):,} tok saved{suffix}")
+        except Exception:
+            pass
+        return lines
+
     def _show_usage(self):
         """Rate limits + session token usage (when a live agent exists) + Nous credits.
 
@@ -9685,6 +9719,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
         print(f"  Messages:         {msg_count}")
         print(f"  Compressions:     {compressions}")
+        for _line in self._compresr_usage_lines():
+            print(_line)
 
         # Account limits -- fetched off-thread with a hard timeout so slow
         # provider APIs don't hang the prompt.
