@@ -96,6 +96,42 @@ def test_api_key_is_env_only(monkeypatch, tmp_path):
     assert not e.is_available()
 
 
+def _parent_reference(context_length):
+    """Build a bare parent ContextCompressor and drive its update_model so we
+    can compare the child's derived budgets against the authoritative parent."""
+    parent = ContextCompressor(model="parent-placeholder", config_context_length=200_000)
+    parent.update_model("m", context_length)
+    return parent
+
+
+def test_update_model_threshold_matches_parent_and_can_fire_small_ctx():
+    """update_model must not re-floor threshold_tokens above the window.
+
+    For ctx <= 64K the parent's small-context carve-out keeps the trigger below
+    the window; re-flooring to MINIMUM_CONTEXT_LENGTH regressed #14690 (threshold
+    >= window → compaction never fires → provider 400)."""
+    e = _engine()
+    e.update_model("m", 64000)
+    parent = _parent_reference(64000)
+    assert e.threshold_tokens == parent.threshold_tokens
+    # The whole point: compaction can still fire before the window fills.
+    assert e.threshold_tokens < 64000
+    # Derived budgets stay in parity with the parent too.
+    assert e.tail_token_budget == parent.tail_token_budget
+    assert e.max_summary_tokens == parent.max_summary_tokens
+
+
+def test_update_model_parity_for_large_contexts():
+    for ctx in (100000, 128000):
+        e = _engine()
+        e.update_model("m", ctx)
+        parent = _parent_reference(ctx)
+        assert e.threshold_tokens == parent.threshold_tokens
+        assert e.threshold_tokens < ctx
+        assert e.tail_token_budget == parent.tail_token_budget
+        assert e.max_summary_tokens == parent.max_summary_tokens
+
+
 def test_compresr_config_metadata_registered():
     from hermes_cli.config import DEFAULT_CONFIG, OPTIONAL_ENV_VARS, validate_config_structure
 

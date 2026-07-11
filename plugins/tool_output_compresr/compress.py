@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # it already processed.
 FOOTER_MARKER = "[compresr:recover]"
 
+# The recovery footer itself costs tokens (~83 for a typical cache path). We gate
+# on the compressed body PLUS this budget so a marginal compression can never come
+# back net-larger than the original once the footer is appended.
+FOOTER_TOKEN_BUDGET = 90
+
 
 def count_tokens(s: str) -> int:
     """Cheap, dependency-free token estimate (~4 chars/token) for gating."""
@@ -79,10 +84,18 @@ def compress_tool_output(
     info["called_api"] = True
     info["api_stats"] = stats
 
-    # Only cache + point back if the API actually shortened the output; a footer
-    # plus a cache write aren't worth it (and would grow the context) otherwise.
+    # A whitespace-only (or empty) compressed body is truthy at the client layer
+    # but would silently replace the tool output with near-nothing + a footer.
+    # Treat it as a failure and fail open to the original.
+    if not compressed or not compressed.strip():
+        info["error"] = "empty compressed output"
+        return content, info
+
+    # Only cache + point back if the API actually shortened the output ONCE the
+    # recovery footer is accounted for; otherwise the footer would push the
+    # returned value net-larger than the original for no gain. Gate BEFORE caching.
     body_tok = count_tokens(compressed)
-    if body_tok >= base_tok:
+    if body_tok + FOOTER_TOKEN_BUDGET >= base_tok:
         return content, info
 
     # Persist the exact original so the pointer resolves. store_original returns an
@@ -93,7 +106,10 @@ def compress_tool_output(
         info["error"] = "cache write failed"
         return content, info
 
-    out = compressed + _footer(cache_path, base_tok, body_tok)
+    # Footer text reports the honest post-footer size (body + footer budget), so
+    # it never understates the returned output's real token cost.
+    reported_out_tok = body_tok + FOOTER_TOKEN_BUDGET
+    out = compressed + _footer(cache_path, base_tok, reported_out_tok)
     out_tok = count_tokens(out)
     info.update(
         {

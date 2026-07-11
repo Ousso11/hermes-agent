@@ -20,15 +20,13 @@ import json  # noqa: E402
 from plugins.tool_output_compresr import ToolOutputCompressor  # noqa: E402
 from plugins.tool_output_compresr import cache, compress  # noqa: E402
 
+# Large enough that a small compressed body is a genuine win even after the
+# recovery footer's token budget (~90) is added back — the size gate now
+# accounts for the footer, so a marginal fixture would (correctly) fail open.
 ORIGINAL = "\n".join(
-    [
-        "line0 alpha",
-        "line1 bravo",
-        "line2 charlie",
-        "line3 delta",
-        "line4 echo",
-        "line5 foxtrot",
-    ]
+    [f"line{i} {word}" for i, word in enumerate(
+        ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] * 40
+    )]
 )
 
 # A short stand-in for the API's compressed output. Keeps a couple of lines and
@@ -348,6 +346,9 @@ def test_backend_cache_prune_without_exec_still_prunes_host_root(tmp_path):
     current = tmp_path / "current"
     old.write_text("x" * 10, encoding="utf-8")
     current.write_text("z" * 10, encoding="utf-8")
+    # Age the eviction candidate past the recovery pin window so size-based
+    # prune reclaims it (recent entries are pinned; see pin-recent).
+    os.utime(old, (1, 1))
 
     _prune_cache_dir_via_backend(object(), str(tmp_path), 1, str(current))
 
@@ -376,6 +377,178 @@ def test_tool_output_api_key_is_env_only(monkeypatch, tmp_path):
     assert c.min_tokens == 7
     assert c.max_cache_mb == 3
     assert not c.active               # no key → inactive
+
+
+# --------------------------------------------------------------------------- #
+# H1: recovery reads of a cached original must not be re-compressed
+# --------------------------------------------------------------------------- #
+def test_hook_skips_recovery_read_of_cached_original(monkeypatch):
+    """A read_file targeting a compresr cache file returns the verbatim original
+    (None from the hook) instead of being re-compressed into a lossy summary."""
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    # If the guard fails, this would fire and mangle the recovery.
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    monkeypatch.setattr(cache, "store_original", lambda *a, **k: _cache_path("x"))
+
+    # Container-translated path (backend-agnostic substring match).
+    out = c.on_transform_tool_result(
+        tool_name="read_file",
+        args={"file_path": f"{CACHE_ROOT}/deadbeef"},
+        result=ORIGINAL,
+        tool_call_id="rec1",
+    )
+    assert out is None
+    assert c.recoveries == 1
+    assert c.get_status()["recoveries"] == 1
+
+
+def test_hook_recovery_guard_matches_host_cache_root(monkeypatch, tmp_path):
+    """The guard also matches a resolved host cache path under get_cache_root()."""
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    host_path = str(cache.get_cache_root() / "abc123")
+    out = c.on_transform_tool_result(
+        tool_name="read_file", args={"file_path": host_path}, result=ORIGINAL,
+    )
+    assert out is None
+    assert c.recoveries == 1
+
+
+# --------------------------------------------------------------------------- #
+# H2: search_files unwraps its real dense shape ("matches_text")
+# --------------------------------------------------------------------------- #
+def test_hook_unwraps_search_files_matches_text(monkeypatch):
+    """search_files emits {"total_count":N,"matches_text":"..."} (never a
+    top-level "content"). The plugin must unwrap matches_text, keep the result
+    valid JSON, and fold the footer into matches_text."""
+    matches = "\n".join(f"file{i}.py\n  {i}: match line {i}" for i in range(60))
+    result = json.dumps({"total_count": 60, "matches_text": matches})
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: _cache_path(cid),
+    )
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(c._client, "compress", lambda **kw: (COMPRESSED, {}))
+    out = c.on_transform_tool_result(
+        tool_name="search_files", args={"pattern": "match"}, result=result,
+        tool_call_id="sf1",
+    )
+    assert out is not None
+    parsed = json.loads(out)                            # still valid JSON
+    assert parsed["total_count"] == 60                  # sibling field preserved
+    assert compress.FOOTER_MARKER in parsed["matches_text"]
+    assert parsed["matches_text"].startswith(COMPRESSED)
+    assert "content" not in parsed
+
+
+# --------------------------------------------------------------------------- #
+# H3: a real FileSyncManager whose upload raises fails open (host file removed)
+# --------------------------------------------------------------------------- #
+def test_store_original_real_sync_upload_failure_fails_open(monkeypatch, tmp_path):
+    from tools.environments.file_sync import FileSyncManager
+
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _boom_upload(host_path, remote_path):
+        raise RuntimeError("transport down")
+
+    # A real manager: sync() catches the transport error internally, so without
+    # raise_on_error the failure would be swallowed and store_original would hand
+    # back a remote path for a file that was never uploaded.
+    sm = FileSyncManager(
+        get_files_fn=lambda: [(str(hermes_home / "x"), "/root/.hermes/x")],
+        upload_fn=_boom_upload,
+        delete_fn=lambda paths: None,
+    )
+    # Force the initial file to look new so sync attempts an upload.
+    (hermes_home).mkdir(parents=True, exist_ok=True)
+    (hermes_home / "x").write_text("seed", encoding="utf-8")
+
+    env = _fake_env("SSHEnvironment", _remote_home="/home/agent", _sync_manager=sm)
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: env)
+
+    assert cache.store_original("sync-boom", ORIGINAL, task_id="t", max_cache_mb=0) is None
+    assert not (hermes_home / "cache" / "compresr" / "tool-output" / "sync-boom").exists()
+
+
+# --------------------------------------------------------------------------- #
+# M1: a marginally-shorter compression must not come back net-larger + footer
+# --------------------------------------------------------------------------- #
+def test_compress_failopen_on_marginal_shrink(monkeypatch):
+    """The size gate now accounts for the ~90-token footer, so a body only a few
+    tokens smaller than the original fails open (no net growth, no cache write)."""
+    stored = {}
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: stored.update({cid: content}) or _cache_path(cid),
+    )
+    base = "x" * 1000                                   # ~250 tokens
+    marginal = "x" * 990                                # ~2.5 tokens shorter — below footer budget
+    out, info = compress.compress_tool_output(
+        query="q", content=base, tool_name="grep", cache_id="marg",
+        client=_FakeClient(out=marginal), task_id="t",
+    )
+    assert out == base
+    assert info["shortened"] is False
+    assert "marg" not in stored                         # cache NOT written on failure
+
+
+# --------------------------------------------------------------------------- #
+# M2: whitespace-only compressed output is treated as a failure (fail open)
+# --------------------------------------------------------------------------- #
+def test_compress_failopen_on_whitespace_only_output(monkeypatch):
+    stored = {}
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: stored.update({cid: content}) or _cache_path(cid),
+    )
+    out, info = compress.compress_tool_output(
+        query="q", content=ORIGINAL, tool_name="grep", cache_id="ws",
+        client=_FakeClient(out="  \n  \t "), task_id="t",
+    )
+    assert out == ORIGINAL
+    assert info["shortened"] is False
+    assert info["error"] == "empty compressed output"
+    assert "ws" not in stored
+
+
+def test_hook_failopen_on_whitespace_only_output(monkeypatch):
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 5
+    monkeypatch.setattr(cache, "store_original", lambda *a, **k: _cache_path("c"))
+    monkeypatch.setattr(c._client, "compress", lambda **kw: ("   \n  ", {}))
+    out = c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="ws1"
+    )
+    assert out is None
+
+
+# --------------------------------------------------------------------------- #
+# M4: recently-written cache entries are pinned against size-based prune
+# --------------------------------------------------------------------------- #
+def test_prune_pins_recently_written_entries(tmp_path):
+    from plugins.tool_output_compresr.cache import _prune_cache_dir_via_backend
+
+    old = tmp_path / "old"
+    fresh = tmp_path / "fresh"
+    current = tmp_path / "current"
+    for p in (old, fresh, current):
+        p.write_text("x" * 10, encoding="utf-8")
+    # Only `old` is aged past the pin window; `fresh` is a footer path a sibling
+    # just handed to the model and must survive even though the dir is over budget.
+    os.utime(old, (1, 1))
+
+    _prune_cache_dir_via_backend(None, str(tmp_path), 1, str(current))
+
+    assert not old.exists()      # aged → evictable
+    assert fresh.exists()        # recent → pinned, survives prune
+    assert current.exists()      # explicit keep
 
 
 if __name__ == "__main__":

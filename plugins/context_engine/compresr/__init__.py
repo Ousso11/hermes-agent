@@ -48,11 +48,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.context_compressor import (
-    ContextCompressor,
-    MINIMUM_CONTEXT_LENGTH,
-    _SUMMARY_TOKENS_CEILING,
-)
+from agent.context_compressor import ContextCompressor
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -172,17 +168,14 @@ class CompresrContextEngine(ContextCompressor):
         provider: str = "",
         api_mode: str = "",
     ) -> None:
-        # Base sets context_length + threshold_tokens (= ctx * threshold_percent).
+        # The parent's update_model already computes threshold_tokens (with the
+        # small-context carve-out that keeps the trigger below the window for
+        # ctx <= 64K) plus tail_token_budget and max_summary_tokens. Re-flooring
+        # to MINIMUM_CONTEXT_LENGTH here pushed the threshold to >= the window
+        # for small contexts, so compaction could never fire (regressing #14690).
+        # There is nothing left for the child to recompute.
         super().update_model(
             model, context_length, base_url, api_key, provider, api_mode
-        )
-        # Apply the same minimum-context floor and derived budgets the parent's
-        # __init__ computes, which base.update_model() skips.
-        self.threshold_tokens = max(self.threshold_tokens, MINIMUM_CONTEXT_LENGTH)
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
-        self.tail_token_budget = target_tokens
-        self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING
         )
 
     # -- Ratio mapping -----------------------------------------------------

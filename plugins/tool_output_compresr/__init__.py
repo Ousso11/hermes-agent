@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from hermes_constants import get_hermes_home
@@ -71,10 +72,9 @@ _UNWRAPPABLE_JSON_TOOLS: Dict[str, str] = {
     "read_file": "content",
     "terminal": "output",
     "execute_code": "output",
-    "shell": "output",
-    "run_shell": "output",
-    "search_files": "content",
-    "grep": "output",
+    # SearchResult.to_dict(densify=True) puts the payload under "matches_text"
+    # (never a top-level "content"), so that is the key to unwrap.
+    "search_files": "matches_text",
 }
 
 
@@ -177,6 +177,7 @@ class ToolOutputCompressor:
         self.calls = 0
         self.errors = 0
         self.tokens_saved = 0
+        self.recoveries = 0
         self._cooldown_until = 0.0
 
     # -- helpers -----------------------------------------------------------
@@ -204,6 +205,41 @@ class ToolOutputCompressor:
         if tool_name:
             return f"Relevant output of the {tool_name} call for the current task"
         return _FALLBACK_QUERY
+
+    @staticmethod
+    def _is_recovery_read(args: Any) -> bool:
+        """True if *args* points at a file under our compresr cache.
+
+        A recovery ``read_file`` (or ``search_files``) targeting a cached
+        original must NOT be re-compressed: the cached file is the verbatim
+        source and is >= min_tokens but carries no FOOTER_MARKER, so without
+        this guard the hook re-fires and returns a lossy summary instead of the
+        exact original the agent asked to recover.
+
+        Backend-agnostic: the cache path always contains the segment
+        ``cache/compresr/tool-output`` — true for the host path AND the
+        container-translated ``/root/.hermes/...`` path. We first try a resolved
+        comparison against the real cache root, then fall back to a substring
+        check on ``cache/compresr`` so remote/translated paths still match.
+        """
+        if not isinstance(args, dict):
+            return False
+        try:
+            cache_root = str(cache.get_cache_root().resolve())
+        except Exception:
+            cache_root = ""
+        for v in args.values():
+            if not isinstance(v, str) or not v:
+                continue
+            if "cache/compresr" in v:
+                return True
+            if cache_root:
+                try:
+                    if str(Path(v).resolve()).startswith(cache_root):
+                        return True
+                except (OSError, ValueError):
+                    pass
+        return False
 
     @staticmethod
     def _cache_id(content: str) -> str:
@@ -234,6 +270,11 @@ class ToolOutputCompressor:
             return None  # don't mangle error results
         if FOOTER_MARKER in result:
             return None  # already compressed by us — idempotent
+        if self._is_recovery_read(args):
+            # The agent is recovering a cached original via read_file/search_files;
+            # return it verbatim rather than re-compressing it into a lossy summary.
+            self.recoveries += 1
+            return None
         if count_tokens(result) < self.min_tokens:
             return None  # too small to be worth a round-trip
         now = time.monotonic()
@@ -303,6 +344,7 @@ class ToolOutputCompressor:
             "calls": self.calls,
             "errors": self.errors,
             "tokens_saved": self.tokens_saved,
+            "recoveries": self.recoveries,
         }
 
 

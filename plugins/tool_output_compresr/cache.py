@@ -11,12 +11,24 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _CACHE_SUBDIR = Path("cache") / "compresr" / "tool-output"
+
+# Serialize write+prune across threads: subagents share one cache dir, and a
+# concurrent prune must never race a sibling that just handed a footer path to
+# the model.
+_STORE_LOCK = threading.Lock()
+
+# Recently-written entries are pinned against size-based eviction for this many
+# seconds so a footer path just returned to the model can't be reclaimed by a
+# parallel prune before the model reads it.
+_PRUNE_PIN_SECONDS = 300.0
 
 
 def get_cache_root() -> Path:
@@ -124,8 +136,16 @@ def _force_sync_visible_cache(cache_path: Path, task_id: str) -> bool:
     if sync_manager is None:
         return True
 
+    # Ask the manager to surface transport failures. FileSyncManager.sync()
+    # otherwise catches errors internally and returns None, so a failed upload
+    # would leave store_original returning a remote path whose file was never
+    # uploaded (a dangling footer). raise_on_error=True re-raises, letting us
+    # fail open. Fall back gracefully for managers without the kwarg.
     try:
-        sync_manager.sync(force=True)
+        try:
+            sync_manager.sync(force=True, raise_on_error=True)
+        except TypeError:
+            sync_manager.sync(force=True)
         return True
     except Exception as e:
         try:
@@ -149,6 +169,7 @@ def _prune_cache_dir_via_backend(
         return
     root = Path(cache_dir)
     keep = Path(keep_path)
+    now = time.time()
     try:
         entries = []
         total = 0
@@ -164,9 +185,14 @@ def _prune_cache_dir_via_backend(
             entries.append((float(stat.st_mtime), path, size))
         if total <= max_bytes:
             return
-        for _, path, size in sorted(entries):
+        for mtime, path, size in sorted(entries):
             try:
                 if path.resolve() == keep.resolve():
+                    continue
+                # Pin recently-written entries: a footer path just handed to
+                # the model must survive a concurrent prune long enough to be
+                # read back, even if the dir is over budget.
+                if now - mtime < _PRUNE_PIN_SECONDS:
                     continue
                 path.unlink()
                 total -= size
@@ -215,13 +241,17 @@ def store_original(
         )
         return None
 
+    # Serialize prune across threads: subagents share this dir, so a concurrent
+    # prune must not race a sibling's scan. Pin-recent (see the pruner) already
+    # protects the file we're about to hand back as a footer path.
     try:
-        _prune_cache_dir_via_backend(
-            None,
-            str(root),
-            max(0, int(max_cache_mb)) * 1024 * 1024,
-            str(cache_path),
-        )
+        with _STORE_LOCK:
+            _prune_cache_dir_via_backend(
+                None,
+                str(root),
+                max(0, int(max_cache_mb)) * 1024 * 1024,
+                str(cache_path),
+            )
     except Exception as e:  # pragma: no cover - pruning must never break recovery
         logger.debug("tool_output_compresr: cache prune failed: %s", e)
     return visible_path
