@@ -123,14 +123,15 @@ def compress_tool_output(
     out = compressed + _footer(cache_path, base_tok, reported_out_tok)
     # Exact gate on the REAL returned size. A long remote-home cache path can make
     # the footer cost more than FOOTER_TOKEN_BUDGET, so the nominal pre-filter is
-    # not sufficient: measure the actual output and, if it isn't a net win, delete
-    # the just-written cache entry and fail open rather than return net-larger.
+    # not sufficient: measure the actual output and, if it isn't a net win, fail
+    # open rather than return net-larger.
     out_tok = count_tokens(out)
     if out_tok >= base_tok:
-        try:
-            cache.cache_file_path(cache_id).unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Do NOT delete the cache entry here. cache_id is content-addressed, so a
+        # concurrent — or prior — compression of identical content may already have
+        # handed this exact path to the model as a recovery pointer; unlinking it
+        # would dangle that pointer. The verbatim original is harmless to leave in
+        # place and the size-based pruner reclaims it if nothing references it.
         info["error"] = "not smaller after footer"
         return content, info
     info.update(

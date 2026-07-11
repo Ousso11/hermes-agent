@@ -45,7 +45,6 @@ import os
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor import ContextCompressor
@@ -64,12 +63,22 @@ _FALLBACK_QUERY = (
 )
 
 
-def _as_int(v: Any) -> int:
-    """Tolerant int coercion for server-supplied stats — never crash on 'N/A'."""
+def _as_int(v: Any, default: int = 0) -> int:
+    """Tolerant int coercion — never crash on 'N/A' server stats or a typo'd
+    numeric config/env value; fall back to *default* instead of raising in
+    ``__init__`` and silently disabling the engine."""
     try:
-        return int(v or 0)
+        return int(v)
     except (TypeError, ValueError):
-        return 0
+        return default
+
+
+def _as_float(v: Any, default: Optional[float]) -> Optional[float]:
+    """Tolerant float coercion (see :func:`_as_int`)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _read_config_block() -> Dict[str, Any]:
@@ -111,16 +120,18 @@ class CompresrContextEngine(ContextCompressor):
             _opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)
         ).rstrip("/")
         self.compresr_model = str(_opt("COMPRESR_MODEL", "model", _DEFAULT_MODEL))
-        self.compresr_timeout = int(_opt("COMPRESR_TIMEOUT", "timeout", _DEFAULT_TIMEOUT))
+        self.compresr_timeout = _as_int(
+            _opt("COMPRESR_TIMEOUT", "timeout", _DEFAULT_TIMEOUT), _DEFAULT_TIMEOUT
+        )
         self.compresr_coarse = str(_opt("COMPRESR_COARSE", "coarse", "")).lower() in (
             "1", "true", "yes",
         )
         self.compresr_disable_placeholders = str(
             _opt("COMPRESR_DISABLE_PLACEHOLDERS", "disable_placeholders", "")
         ).lower() in ("1", "true", "yes")
-        _ratio_override = _opt("COMPRESR_TARGET_RATIO", "target_ratio", "")
-        self.compresr_ratio_override: Optional[float] = (
-            float(_ratio_override) if str(_ratio_override).strip() else None
+        # Empty/unset or malformed -> None (no override); a valid number wins.
+        self.compresr_ratio_override: Optional[float] = _as_float(
+            _opt("COMPRESR_TARGET_RATIO", "target_ratio", ""), None
         )
 
         # Cumulative API stats for get_status() / benchmarking.

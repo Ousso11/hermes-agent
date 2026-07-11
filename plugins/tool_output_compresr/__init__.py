@@ -69,6 +69,13 @@ _FALLBACK_QUERY = (
 _QUERY_ARG_KEYS = ("query", "pattern", "command", "q", "search", "regex", "url")
 _PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
 
+# The full path segment every recovery target carries — host path AND the
+# container-translated "/root/.hermes/cache/compresr/tool-output/<id>". Matching
+# this whole segment (not a bare "cache/compresr") keeps ordinary greps/reads
+# that merely mention the substring from being misread as recovery reads. Kept in
+# sync with cache._CACHE_SUBDIR.
+_CACHE_PATH_MARKER = "cache/compresr/tool-output"
+
 # Tool → key holding the plain-text payload inside a JSON envelope. Compressing
 # the raw envelope wastes ratio on JSON syntax and escaped "\n", and caches an
 # unreadable escaped blob; unwrapping compresses (and caches) the real content,
@@ -149,6 +156,26 @@ def _as_bool(v: Any) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
 
 
+def _as_int(v: Any, default: int) -> int:
+    """Tolerant int coercion — a malformed config/env value (e.g. a typo'd
+    ``COMPRESR_TOOL_OUTPUT_TIMEOUT``) falls back to *default* instead of raising
+    in ``__init__`` and silently disabling the whole plugin."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        logger.warning("tool_output_compresr: invalid numeric value %r, using %s", v, default)
+        return default
+
+
+def _as_float(v: Any, default: float) -> float:
+    """Tolerant float coercion (see :func:`_as_int`)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        logger.warning("tool_output_compresr: invalid numeric value %r, using %s", v, default)
+        return default
+
+
 class ToolOutputCompressor:
     """Holds config + clients and implements the transform hook."""
 
@@ -173,25 +200,29 @@ class ToolOutputCompressor:
         self.model = str(
             _opt("COMPRESR_TOOL_OUTPUT_MODEL", "tool_output_model", DEFAULT_TOOL_OUTPUT_MODEL)
         )
-        self.min_tokens = int(
-            _opt("COMPRESR_TOOL_OUTPUT_MIN_TOKENS", "tool_output_min_tokens", _DEFAULT_MIN_TOKENS)
+        self.min_tokens = _as_int(
+            _opt("COMPRESR_TOOL_OUTPUT_MIN_TOKENS", "tool_output_min_tokens", _DEFAULT_MIN_TOKENS),
+            _DEFAULT_MIN_TOKENS,
         )
-        self.timeout = int(
-            _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT)
+        self.timeout = _as_int(
+            _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT),
+            _DEFAULT_TIMEOUT,
         )
-        self.max_cache_mb = int(
+        self.max_cache_mb = _as_int(
             _opt(
                 "COMPRESR_TOOL_OUTPUT_MAX_CACHE_MB",
                 "tool_output_max_cache_mb",
                 _DEFAULT_MAX_CACHE_MB,
-            )
+            ),
+            _DEFAULT_MAX_CACHE_MB,
         )
-        self.target_ratio = float(
+        self.target_ratio = _as_float(
             _opt(
                 "COMPRESR_TOOL_OUTPUT_TARGET_RATIO",
                 "tool_output_target_ratio",
                 _DEFAULT_TARGET_RATIO,
-            )
+            ),
+            _DEFAULT_TARGET_RATIO,
         )
 
         self._client = CompresrToolOutputClient(
@@ -242,9 +273,9 @@ class ToolOutputCompressor:
 
         Backend-agnostic: the cache path always contains the segment
         ``cache/compresr/tool-output`` — true for the host path AND the
-        container-translated ``/root/.hermes/...`` path. We first try a resolved
-        comparison against the real cache root, then fall back to a substring
-        check on ``cache/compresr`` so remote/translated paths still match.
+        container-translated ``/root/.hermes/...`` path. We first check for that
+        full segment (which remote/translated paths still carry), then fall back
+        to a resolved comparison against the real cache root.
         """
         if not isinstance(args, dict):
             return False
@@ -255,7 +286,7 @@ class ToolOutputCompressor:
         for v in args.values():
             if not isinstance(v, str) or not v:
                 continue
-            if "cache/compresr" in v:
+            if _CACHE_PATH_MARKER in v:
                 return True
             if cache_root:
                 try:
