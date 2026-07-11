@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -76,6 +77,25 @@ _UNWRAPPABLE_JSON_TOOLS: Dict[str, str] = {
     # (never a top-level "content"), so that is the key to unwrap.
     "search_files": "matches_text",
 }
+
+# Tools whose unwrapped payload arrives ALREADY line-numbered ("N|code", from
+# read_file's _add_line_numbers). Caching that numbered text would make a
+# recovery read_file re-number it -> a doubled "M|N|code" gutter. We cache a
+# DE-NUMBERED copy so read_file re-adds exactly one clean gutter on recovery.
+# (The API call and size gate still run against the numbered payload.)
+_NUMBERED_JSON_TOOLS = {"read_file"}
+_LINE_GUTTER_RE = re.compile(r"^\d+\|")
+
+
+def _strip_line_gutter(text: str) -> str:
+    return "\n".join(_LINE_GUTTER_RE.sub("", ln) for ln in text.split("\n"))
+
+
+def _is_fully_guttered(text: str) -> bool:
+    """True only if every non-blank line carries an ``N|`` gutter, so stripping
+    can't mangle a payload that merely happens to contain a ``|``."""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    return bool(lines) and all(_LINE_GUTTER_RE.match(ln) for ln in lines)
 
 
 def _try_unwrap_json_tool_result(
@@ -288,11 +308,23 @@ class ToolOutputCompressor:
         if inner_text is not None and count_tokens(inner_text) < self.min_tokens:
             return None
 
+        # For already-numbered payloads (read_file), cache a de-numbered copy so
+        # a recovery read_file re-adds exactly one clean gutter instead of a
+        # doubled "M|N|" prefix. The API + size gate still see compress_target.
+        cache_content = compress_target
+        if (
+            inner_text is not None
+            and tool_name in _NUMBERED_JSON_TOOLS
+            and _is_fully_guttered(inner_text)
+        ):
+            cache_content = _strip_line_gutter(inner_text)
+
         cache_id = self._cache_id(compress_target)
         try:
             out, info = compress_tool_output(
                 query=query,
                 content=compress_target,
+                cache_content=cache_content,
                 tool_name=tool_name,
                 cache_id=cache_id,
                 client=self._client,

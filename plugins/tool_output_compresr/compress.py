@@ -14,7 +14,7 @@ original, returns the original content unchanged.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from . import cache
 from .client import CompresrToolOutputClient
@@ -56,13 +56,22 @@ def compress_tool_output(
     task_id: str = "default",
     max_cache_mb: int = 256,
     target_ratio: float = 2.0,
+    cache_content: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Compress via Compresr, store the original, append a recovery footer.
 
     Returns ``(output_text, info)``. Never raises: an API failure (or output that
     isn't meaningfully shorter) falls back to the original content with
     ``shortened`` False so the caller leaves the tool output unchanged.
+
+    ``cache_content`` is the text persisted to the recovery cache; it defaults to
+    ``content`` but may differ (e.g. a de-numbered copy of already-line-numbered
+    read_file output, so a later ``read_file`` on the cache re-adds exactly one
+    gutter instead of showing a doubled ``M|N|`` prefix). The API call and the
+    size gate always use ``content``.
     """
+    if cache_content is None:
+        cache_content = content
     base_tok = count_tokens(content)
     info: Dict[str, Any] = {
         "called_api": False,
@@ -101,7 +110,7 @@ def compress_tool_output(
     # Persist the exact original so the pointer resolves. store_original returns an
     # agent-visible path (or None if the active backend can't prove one) — on None
     # we fail open rather than point at a file the agent cannot read.
-    cache_path = cache.store_original(cache_id, content, task_id, max_cache_mb=max_cache_mb)
+    cache_path = cache.store_original(cache_id, cache_content, task_id, max_cache_mb=max_cache_mb)
     if cache_path is None:
         info["error"] = "cache write failed"
         return content, info

@@ -551,6 +551,44 @@ def test_prune_pins_recently_written_entries(tmp_path):
     assert current.exists()      # explicit keep
 
 
+import plugins.tool_output_compresr as toc  # noqa: E402
+
+
+def test_gutter_helpers():
+    assert toc._is_fully_guttered("1|def f():\n2|    return 1")
+    assert not toc._is_fully_guttered("plain text\nno gutter")
+    # a line that merely contains a pipe must not be mistaken for a gutter
+    assert not toc._is_fully_guttered("a | b table")
+    assert toc._strip_line_gutter("3|def f():\n4|    return 1") == "def f():\n    return 1"
+    assert toc._strip_line_gutter("a | b") == "a | b"  # untouched
+
+
+def test_read_file_output_cached_denumbered(monkeypatch):
+    """read_file content arrives line-numbered (N|code); the cache must store a
+    DE-numbered copy so a recovery read_file re-adds exactly one gutter, not two."""
+    body = "\n".join("%d|line %d content here" % (i, i) for i in range(1, 60))
+    result = json.dumps({"content": body, "path": "/x"})
+    stored = {}
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: stored.update({"content": content})
+        or "/hermes/cache/compresr/tool-output/" + cid,
+    )
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(c._client, "compress", lambda **kw: ("line 1 content here\n[56 lines removed]", {}))
+    out = c.on_transform_tool_result(
+        tool_name="read_file", args={"file_path": "/x"}, result=result,
+        task_id="t", tool_call_id="tc-num",
+    )
+    assert out is not None
+    # what was cached is the DE-numbered content (no "N|" gutters)
+    cached = stored["content"]
+    assert cached.startswith("line 1 content here")
+    assert "1|line 1" not in cached
+    assert cached == "\n".join("line %d content here" % i for i in range(1, 60))
+
+
 if __name__ == "__main__":
     import pytest
 
