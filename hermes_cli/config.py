@@ -1493,6 +1493,25 @@ DEFAULT_CONFIG = {
         "auto_subscribe_on_create": True,
     },
 
+    # Compresr context and tool-output compression plugin settings. Secrets
+    # stay in ~/.hermes/.env (COMPRESR_API_KEY); this block is non-secret
+    # behavior only.
+    "compresr": {
+        "base_url": "https://api.compresr.ai/api",
+        "model": "latte_v2",
+        "target_ratio": "",
+        "timeout": 60,
+        "coarse": False,
+        "disable_placeholders": False,
+        "tool_output_enabled": True,
+        "tool_output_model": "toc_latte_v2",
+        "tool_output_min_tokens": 1500,
+        "tool_output_timeout": 30,
+        # Best-effort cap for Hermes-managed compresr originals written by
+        # the per-turn tool-output plugin. 0 disables pruning.
+        "tool_output_max_cache_mb": 256,
+    },
+
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
@@ -3747,6 +3766,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "COMPRESR_API_KEY": {
+        "description": "Compresr API key for context and tool-output compression",
+        "prompt": "Compresr API key",
+        "url": "https://compresr.ai/dashboard/tokens",
+        "tools": ["context_engine", "tool_output_compresr"],
+        "password": True,
+        "category": "tool",
+    },
     "FIRECRAWL_API_URL": {
         "description": "Firecrawl API URL for self-hosted instances (optional)",
         "prompt": "Firecrawl API URL (leave empty for cloud)",
@@ -5214,7 +5241,7 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
+    "auxiliary", "moa", "custom_providers", "context", "compresr", "memory", "gateway",
     "sessions", "streaming", "updates", "mcp_servers",
 }
 
