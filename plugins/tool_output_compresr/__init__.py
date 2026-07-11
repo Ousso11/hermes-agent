@@ -12,7 +12,11 @@ This is the per-turn complement to ``plugins/context_engine/compresr`` (which
 compresses at compaction time). The two compose: this is a pre-filter that
 shrinks each output once, so compaction has less residual to summarize.
 
-Activation (opt-in, off by default):
+Activation: enable the plugin (via ``plugins.enabled`` or the ``hermes setup``
+Compresr choice) and set a key. Once the plugin is loaded with a key present,
+tool-output compression is ON by default — ``tool_output_enabled`` defaults to
+true; set it false to keep the plugin loaded but leave compression off. The
+plugin stays inert until it is listed in ``plugins.enabled``.
 
     # ~/.hermes/config.yaml
     compresr:

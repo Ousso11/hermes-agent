@@ -13,6 +13,7 @@ plugin to a no-op:
 """
 
 import inspect
+import json
 import os
 import sys
 
@@ -39,6 +40,103 @@ def test_override_signature_matches_parent():
     assert list(parent) == list(child), (
         "parent _generate_summary signature changed — update the override"
     )
+
+
+def test_update_model_signature_matches_parent():
+    """The update_model override must stay signature-compatible with the parent
+    so a caller passing e.g. max_tokens never hits a TypeError or a silently
+    dropped argument. Pins the parameter list against the authoritative parent."""
+    parent = inspect.signature(ContextCompressor.update_model).parameters
+    child = inspect.signature(CompresrContextEngine.update_model).parameters
+    assert list(parent) == list(child), (
+        "parent update_model signature changed — update the override"
+    )
+
+
+def test_update_model_forwards_max_tokens_to_parent():
+    """max_tokens must be forwarded, not dropped."""
+    e = _engine()
+    seen = {}
+
+    def _spy(self, model, context_length, base_url="", api_key="", provider="",
+             api_mode="", max_tokens=None):
+        seen["max_tokens"] = max_tokens
+
+    orig = ContextCompressor.update_model
+    try:
+        ContextCompressor.update_model = _spy  # type: ignore[method-assign]
+        e.update_model("m", 128000, max_tokens=4096)
+    finally:
+        ContextCompressor.update_model = orig  # type: ignore[method-assign]
+    assert seen["max_tokens"] == 4096
+
+
+def test_call_compresr_builds_request_and_parses_compressed_context(monkeypatch):
+    """Pin the HTTP contract of the question-specific client: payload shape,
+    X-API-Key header, and the response envelope key ``compressed_context``
+    (which DIFFERS from the tool-output endpoint's ``compressed_output`` — a
+    real drift footgun if the two are ever conflated)."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    captured = {}
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body.encode("utf-8")
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _Resp(json.dumps({"success": True, "data": {
+            "compressed_context": "KEPT summary", "tokens_saved": 12,
+        }}))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    e = _engine()
+    e.compresr_model = "latte_v2"
+    text, stats = e._call_compresr("some context", "the query")
+
+    assert text == "KEPT summary"
+    assert stats["tokens_saved"] == 12
+    req = captured["req"]
+    assert req.full_url.endswith("/compress/question-specific/")
+    assert req.get_header("X-api-key") == "cmp_test"
+    payload = json.loads(req.data)
+    assert payload["context"] == "some context"
+    assert payload["query"] == "the query"
+    assert payload["compression_model_name"] == "latte_v2"
+    assert "target_compression_ratio" in payload
+
+    # success:false → RuntimeError so the caller can fall back.
+    def _fail(req, timeout=None):
+        return _Resp(json.dumps({"success": False, "message": "nope"}))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fail)
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        e._call_compresr("c", "q")
+
+    # HTTPError → RuntimeError carrying the status + server detail.
+    def _http_err(req, timeout=None):
+        raise urllib.error.HTTPError(
+            "u", 422, "Unprocessable", None, io.BytesIO(b'{"detail":"bad"}')
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _http_err)
+    with _pytest.raises(RuntimeError) as ei:
+        e._call_compresr("c", "q")
+    assert "422" in str(ei.value)
 
 
 def test_success_returns_prefixed_body():

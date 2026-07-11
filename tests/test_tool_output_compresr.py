@@ -589,6 +589,138 @@ def test_read_file_output_cached_denumbered(monkeypatch):
     assert cached == "\n".join("line %d content here" % i for i in range(1, 60))
 
 
+# --------------------------------------------------------------------------- #
+# C: the size gate is EXACT — a long cache path whose footer exceeds the nominal
+# FOOTER_TOKEN_BUDGET must not sneak a net-larger output past the gate.
+# --------------------------------------------------------------------------- #
+def test_compress_failopen_when_long_cache_path_makes_output_net_larger(monkeypatch):
+    """A body a bit under the nominal budget passes the cheap pre-filter, but a
+    very long remote cache path makes the real footer cost far more than
+    FOOTER_TOKEN_BUDGET. The exact post-footer gate must catch it and fail open."""
+    long_path = "/root/.hermes/cache/compresr/tool-output/" + ("a" * 560)
+    monkeypatch.setattr(
+        cache, "store_original",
+        lambda cid, content, task_id="default", **_: long_path,
+    )
+    base = "x" * 4000            # ~1000 tokens
+    body = "x" * 3400            # ~850 tokens: 850 + 90 (budget) < 1000 → passes pre-filter
+    out, info = compress.compress_tool_output(
+        query="q", content=base, tool_name="grep", cache_id="longpath",
+        client=_FakeClient(out=body), task_id="t",
+    )
+    assert out == base                                   # failed open, original returned
+    assert info["shortened"] is False
+    assert info["error"] == "not smaller after footer"
+
+
+# --------------------------------------------------------------------------- #
+# D: HTTP contract of the tool-output client (payload shape, headers, envelope).
+# Kept unmocked at the urllib layer so envelope-key drift (compressed_output vs
+# the engine's compressed_context) fails loudly.
+# --------------------------------------------------------------------------- #
+class _FakeResp:
+    def __init__(self, body):
+        self._b = body.encode("utf-8")
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_tool_output_client_builds_request_and_parses_compressed_output(monkeypatch):
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    captured = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeResp(json.dumps({"success": True, "data": {
+            "compressed_output": "SHORT\n[3 lines removed]", "tokens_saved": 7,
+        }}))
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    client = CompresrToolOutputClient(api_key="cmp_secret", model="toc_latte_v2")
+    text, data = client.compress(
+        tool_output="a huge dump", query="grep: foo", tool_name="grep",
+        target_ratio=2.0,
+    )
+
+    assert text == "SHORT\n[3 lines removed]"
+    assert data["tokens_saved"] == 7
+    req = captured["req"]
+    assert req.full_url.endswith("/compress/tool-output/")
+    assert req.get_header("X-api-key") == "cmp_secret"
+    assert req.get_header("User-agent") == CompresrToolOutputClient.USER_AGENT
+    assert req.get_header("Content-type") == "application/json"
+    payload = json.loads(req.data)
+    assert payload["tool_output"] == "a huge dump"
+    assert payload["query"] == "grep: foo"
+    assert payload["tool_name"] == "grep"
+    assert payload["compression_model_name"] == "toc_latte_v2"
+    assert payload["source"] == "sdk:python"          # server-validated enum
+    assert payload["coarse"] is True
+    assert payload["disable_placeholders"] is False
+    assert payload["target_compression_ratio"] == 2.0
+
+
+def test_tool_output_client_raises_on_api_failure_and_empty(monkeypatch):
+    import pytest as _pytest
+    import urllib.request
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    client = CompresrToolOutputClient(api_key="cmp_secret")
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(json.dumps(
+                            {"success": False, "message": "bad source"})))
+    with _pytest.raises(RuntimeError):
+        client.compress(tool_output="x", query="q", tool_name="grep")
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(json.dumps(
+                            {"success": True, "data": {"compressed_output": ""}})))
+    with _pytest.raises(RuntimeError):
+        client.compress(tool_output="x", query="q", tool_name="grep")
+
+
+def test_tool_output_client_raises_on_http_error_with_detail(monkeypatch):
+    import io
+    import pytest as _pytest
+    import urllib.error
+    import urllib.request
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    def _http_err(req, timeout=None):
+        raise urllib.error.HTTPError(
+            "u", 422, "Unprocessable", None, io.BytesIO(b'{"detail":"bad source"}')
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _http_err)
+    client = CompresrToolOutputClient(api_key="cmp_secret")
+    with _pytest.raises(RuntimeError) as ei:
+        client.compress(tool_output="x", query="q", tool_name="grep")
+    assert "422" in str(ei.value)
+
+
+def test_tool_output_client_requires_key_and_output():
+    import pytest as _pytest
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    with _pytest.raises(RuntimeError):
+        CompresrToolOutputClient(api_key="").compress(
+            tool_output="x", query="q", tool_name="grep")
+    with _pytest.raises(RuntimeError):
+        CompresrToolOutputClient(api_key="k").compress(
+            tool_output="", query="q", tool_name="grep")
+
+
 if __name__ == "__main__":
     import pytest
 

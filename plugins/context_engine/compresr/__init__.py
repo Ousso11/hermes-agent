@@ -164,18 +164,21 @@ class CompresrContextEngine(ContextCompressor):
         model: str,
         context_length: int,
         base_url: str = "",
-        api_key: str = "",
+        api_key: Any = "",
         provider: str = "",
         api_mode: str = "",
+        max_tokens: int | None = None,
     ) -> None:
         # The parent's update_model already computes threshold_tokens (with the
         # small-context carve-out that keeps the trigger below the window for
         # ctx <= 64K) plus tail_token_budget and max_summary_tokens. Re-flooring
         # to MINIMUM_CONTEXT_LENGTH here pushed the threshold to >= the window
         # for small contexts, so compaction could never fire (regressing #14690).
-        # There is nothing left for the child to recompute.
+        # There is nothing left for the child to recompute — we forward every
+        # parameter (incl. max_tokens) verbatim so the override stays a pure
+        # signature-compatible pass-through as the parent evolves.
         super().update_model(
-            model, context_length, base_url, api_key, provider, api_mode
+            model, context_length, base_url, api_key, provider, api_mode, max_tokens
         )
 
     # -- Ratio mapping -----------------------------------------------------

@@ -100,9 +100,11 @@ def compress_tool_output(
         info["error"] = "empty compressed output"
         return content, info
 
-    # Only cache + point back if the API actually shortened the output ONCE the
-    # recovery footer is accounted for; otherwise the footer would push the
-    # returned value net-larger than the original for no gain. Gate BEFORE caching.
+    # Cheap pre-filter: if the compressed body plus a nominal footer budget isn't
+    # smaller than the original, skip the cache write / remote sync entirely.
+    # FOOTER_TOKEN_BUDGET is only an ESTIMATE of the footer cost; the exact
+    # net-size check happens post-footer below, once the real cache path (whose
+    # length drives the footer size) is known.
     body_tok = count_tokens(compressed)
     if body_tok + FOOTER_TOKEN_BUDGET >= base_tok:
         return content, info
@@ -119,7 +121,18 @@ def compress_tool_output(
     # it never understates the returned output's real token cost.
     reported_out_tok = body_tok + FOOTER_TOKEN_BUDGET
     out = compressed + _footer(cache_path, base_tok, reported_out_tok)
+    # Exact gate on the REAL returned size. A long remote-home cache path can make
+    # the footer cost more than FOOTER_TOKEN_BUDGET, so the nominal pre-filter is
+    # not sufficient: measure the actual output and, if it isn't a net win, delete
+    # the just-written cache entry and fail open rather than return net-larger.
     out_tok = count_tokens(out)
+    if out_tok >= base_tok:
+        try:
+            cache.cache_file_path(cache_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+        info["error"] = "not smaller after footer"
+        return content, info
     info.update(
         {
             "shortened": True,

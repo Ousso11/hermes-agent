@@ -61,18 +61,26 @@ This is the **per-turn** complement to the **compaction-time**
 this plugin is a pre-filter that shrinks each tool output once, so compaction has
 far less residual to summarize. Enable either or both.
 
-## Activation (opt-in, off by default)
+## Activation
+
+Enable the plugin — run `hermes setup` and choose **Compresr**, or add
+`tool_output_compresr` to `plugins.enabled` — and provide a key:
 
 ```yaml
 # ~/.hermes/config.yaml
 compresr:
-  tool_output_enabled: true
+  tool_output_enabled: true   # master switch — on by default
 ```
 ```bash
 # ~/.hermes/.env
 COMPRESR_API_KEY=cmp_...
 ```
-Or run `hermes setup` and choose **Compresr** for the compression engine.
+
+Once the plugin is loaded and a key is present, tool-output compression is **on
+by default** (`tool_output_enabled` defaults to `true`). Set it to `false` to
+keep the plugin loaded but leave tool-output compression off. The plugin stays
+fully inert until it is listed in `plugins.enabled`, so nothing is sent to
+Compresr until you opt in.
 
 ## Configuration
 
