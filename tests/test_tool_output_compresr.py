@@ -645,7 +645,7 @@ def test_tool_output_client_builds_request_and_parses_compressed_output(monkeypa
     assert payload["query"] == "grep: foo"
     assert payload["tool_name"] == "grep"
     assert payload["compression_model_name"] == "toc_latte_v2"
-    assert payload["source"] == "gateway:hermes"
+    assert payload["source"] == "integration:hermes"
     assert payload["coarse"] is True
     assert payload["disable_placeholders"] is False
     assert payload["target_compression_ratio"] == 2.0

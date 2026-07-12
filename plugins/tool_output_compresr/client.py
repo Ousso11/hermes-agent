@@ -21,7 +21,7 @@ _ERR_DETAIL_MAXLEN = 300
 
 
 class CompresrToolOutputClient:
-    DEFAULT_SOURCE = "gateway:hermes"
+    DEFAULT_SOURCE = "integration:hermes"
     USER_AGENT = "hermes-tool-output/0.1"
 
     def __init__(

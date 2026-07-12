@@ -119,7 +119,7 @@ def test_call_compresr_builds_request_and_parses_compressed_context(monkeypatch)
     assert payload["query"] == "the query"
     assert payload["compression_model_name"] == "latte_v2"
     assert "target_compression_ratio" in payload
-    assert payload["source"] == "gateway:hermes"
+    assert payload["source"] == "integration:hermes"
 
     # success:false → RuntimeError so the caller can fall back.
     def _fail(req, timeout=None):

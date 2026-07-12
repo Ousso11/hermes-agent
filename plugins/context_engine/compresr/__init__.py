@@ -61,7 +61,7 @@ _MIN_KEEP_FRACTION = 0.01
 _MAX_KEEP_FRACTION = 0.95
 _DEFAULT_KEEP_FRACTION = 0.2
 _MAX_NX = 200.0
-_SOURCE_TAG = "gateway:hermes"
+_SOURCE_TAG = "integration:hermes"
 # Compresr requires a non-empty query; sent when no recent user focus derivable.
 _FALLBACK_QUERY = (
     "Preserve the key facts, decisions, file paths, commands, results, and open "
