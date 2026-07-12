@@ -13,10 +13,10 @@ compresses at compaction time). The two compose: this is a pre-filter that
 shrinks each output once, so compaction has less residual to summarize.
 
 Activation: enable the plugin (via ``plugins.enabled`` or the ``hermes setup``
-Compresr choice) and set a key. Once the plugin is loaded with a key present,
-tool-output compression is ON by default — ``tool_output_enabled`` defaults to
-true; set it false to keep the plugin loaded but leave compression off. The
-plugin stays inert until it is listed in ``plugins.enabled``.
+Compresr choice) and set a key. ``tool_output_enabled`` is written as ``true``
+by Hermes's DEFAULT_CONFIG and by the setup wizard; set it to ``false`` to keep
+the plugin loaded but leave compression off. The plugin stays inert until it is
+listed in ``plugins.enabled``.
 
     # ~/.hermes/config.yaml
     compresr:

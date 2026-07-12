@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 # Marks our own footer so the hook never re-compresses an output it produced.
 FOOTER_MARKER = "[compresr:recover]"
 
-# Estimated footer cost (~83 tok for a typical cache path). The pre-filter gates
-# on body + this budget; the exact net-size check runs post-footer below.
+# Conservative footer token budget (path embedded twice: in prose + read_file hint).
+# The exact net-size check below catches any long remote-home path that exceeds it.
 FOOTER_TOKEN_BUDGET = 90
 
 # Rough chars-per-token used for dependency-free gating estimates.

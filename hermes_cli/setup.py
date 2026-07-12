@@ -2727,11 +2727,15 @@ def _setup_context_compression(config: dict):
     ]
     idx = prompt_choice("Compression engine:", choices, 1 if currently_on else 0)
     if idx == 0:
-        # Explicitly revert to the built-in engine + disable the hook.
         config.setdefault("context", {})["engine"] = "compressor"
         config.setdefault("compresr", {})["tool_output_enabled"] = False
         _set_plugin_enabled(config, "tool_output_compresr", False)
         print_info("Using the built-in compressor.")
+        if get_env_value("COMPRESR_API_KEY"):
+            print_info(
+                "To fully remove Compresr: delete COMPRESR_API_KEY from ~/.hermes/.env "
+                "and rm -rf ~/.hermes/cache/compresr/ to clear cached tool outputs."
+            )
         return
 
     print_warning(
@@ -2762,6 +2766,11 @@ def _setup_context_compression(config: dict):
     print_success(
         "Compresr enabled (compaction-time + per-turn tool-output compression)"
     )
+
+
+SETUP_SECTIONS.append(
+    ("compression", "Context Compression", _setup_context_compression)
+)
 
 
 def _set_plugin_enabled(config: dict, name: str, enabled: bool):

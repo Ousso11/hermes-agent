@@ -21,9 +21,7 @@ _ERR_DETAIL_MAXLEN = 300
 
 
 class CompresrToolOutputClient:
-    # "sdk:python" is the closest server-validated source enum for an in-process
-    # plugin; the User-Agent carries the Hermes identity for telemetry.
-    DEFAULT_SOURCE = "sdk:python"
+    DEFAULT_SOURCE = "gateway:hermes"
     USER_AGENT = "hermes-tool-output/0.1"
 
     def __init__(

@@ -55,15 +55,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = "https://api.compresr.ai/api"
 _DEFAULT_MODEL = "latte_v2"
 _DEFAULT_TIMEOUT = 60
-_FAILURE_COOLDOWN_SECONDS = 30.0     # back-off after a failed/empty compaction
-_PLACEHOLDER_CONTEXT_LEN = 200_000   # pre-update_model context budget (no lookup)
-# Keep-fraction → Nx mapping bounds for target_compression_ratio.
+_FAILURE_COOLDOWN_SECONDS = 30.0
+_PLACEHOLDER_CONTEXT_LEN = 200_000
 _MIN_KEEP_FRACTION = 0.01
 _MAX_KEEP_FRACTION = 0.95
 _DEFAULT_KEEP_FRACTION = 0.2
 _MAX_NX = 200.0
-# Generic query used when no recent user focus can be derived (Compresr requires
-# a non-empty query).
+_SOURCE_TAG = "gateway:hermes"
+# Compresr requires a non-empty query; sent when no recent user focus derivable.
 _FALLBACK_QUERY = (
     "Preserve the key facts, decisions, file paths, commands, results, and open "
     "tasks needed to continue this work."
@@ -159,12 +158,10 @@ class CompresrContextEngine(ContextCompressor):
         self.compresr_disable_placeholders = str(
             _opt("COMPRESR_DISABLE_PLACEHOLDERS", "disable_placeholders", "")
         ).lower() in ("1", "true", "yes")
-        # Empty/unset or malformed -> None (no override); a valid number wins.
         self.compresr_ratio_override: Optional[float] = _as_float(
             _opt("COMPRESR_TARGET_RATIO", "target_ratio", ""), None
         )
 
-        # Cumulative API stats for get_status() / benchmarking.
         self.compresr_calls = 0
         self.compresr_errors = 0
         self.compresr_tokens_in = 0
@@ -336,6 +333,7 @@ class CompresrContextEngine(ContextCompressor):
             "query": query,
             "compression_model_name": self.compresr_model,
             "target_compression_ratio": self._target_compression_ratio(),
+            "source": _SOURCE_TAG,
         }
         if self.compresr_model == "latte_v1":
             payload["coarse"] = self.compresr_coarse
