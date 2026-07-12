@@ -12,6 +12,8 @@ translation, and size-based retention.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json  # noqa: E402
@@ -700,7 +702,50 @@ def test_tool_output_client_requires_key_and_output():
             tool_output="", query="q", tool_name="grep")
 
 
-if __name__ == "__main__":
-    import pytest
+def test_secure_base_url_rejects_cloud_metadata_ip():
+    from plugins.tool_output_compresr import _secure_base_url
 
+    default = "https://api.compresr.ai"
+    assert _secure_base_url("https://169.254.169.254/", default) == default
+    assert _secure_base_url("https://metadata.google.internal/", default) == default
+
+
+def test_client_url_error_routed_through_runtime_error(monkeypatch):
+    # Regression: urllib.error.URLError (DNS failure, connect refused,
+    # socket.timeout) is not a subclass of HTTPError; must be caught explicitly
+    # so callers get a fail-open-worthy RuntimeError instead of a raw URLError.
+    import urllib.error
+    import urllib.request as ureq
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    def _boom(*_a, **_kw):
+        raise urllib.error.URLError("Name or service not known")
+
+    monkeypatch.setattr(ureq, "urlopen", _boom)
+    with pytest.raises(RuntimeError, match="connection error"):
+        CompresrToolOutputClient(api_key="cmp_test").compress(
+            tool_output="hello", query="q", tool_name="grep"
+        )
+
+
+def test_client_json_decode_error_routed_through_runtime_error(monkeypatch):
+    import urllib.request as ureq
+    from plugins.tool_output_compresr.client import CompresrToolOutputClient
+
+    class _Resp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_a):
+            return False
+        def read(self):
+            return b"<html>gateway error</html>"
+
+    monkeypatch.setattr(ureq, "urlopen", lambda *a, **kw: _Resp())
+    with pytest.raises(RuntimeError, match="non-JSON response"):
+        CompresrToolOutputClient(api_key="cmp_test").compress(
+            tool_output="hello", query="q", tool_name="grep"
+        )
+
+
+if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

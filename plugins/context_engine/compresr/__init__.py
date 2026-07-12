@@ -107,17 +107,44 @@ def _read_config_block(key: str = "compresr") -> Dict[str, Any]:
         return {}
 
 
+_BLOCKED_METADATA_HOSTS = frozenset({
+    "169.254.169.254",  # AWS / GCP / Azure IMDS
+    "fd00:ec2::254",  # AWS IMDSv2 IPv6
+    "100.100.100.200",  # Alibaba
+    "168.63.129.16",  # Azure wire-server
+    "metadata.google.internal",
+    "metadata.goog",
+})
+
+
 def _secure_base_url(url: str, default: str) -> str:
     """Reject a non-HTTPS base_url (except localhost) so a stray config/env value
     can't silently downgrade egress to cleartext or redirect the API key to an
-    attacker-controlled host. Falls back to *default* with a warning."""
+    attacker-controlled host. Also blocks cloud-metadata endpoints so a
+    misconfigured base_url can't exfiltrate the API key to IMDS. Falls back to
+    *default* with a warning."""
+    import ipaddress
     from urllib.parse import urlparse
 
     try:
         parsed = urlparse(url)
     except Exception:
         parsed = None
-    host = (parsed.hostname or "") if parsed else ""
+    host = (parsed.hostname or "").lower() if parsed else ""
+
+    def _is_metadata_host() -> bool:
+        if host in _BLOCKED_METADATA_HOSTS:
+            return True
+        try:
+            return str(ipaddress.ip_address(host)) in _BLOCKED_METADATA_HOSTS
+        except ValueError:
+            return False
+
+    if parsed and _is_metadata_host():
+        logger.warning(
+            "compresr: refusing base_url %r (cloud-metadata host); using %s", url, default,
+        )
+        return default
     if parsed and parsed.scheme == "https":
         return url
     if parsed and parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
@@ -149,8 +176,8 @@ class CompresrContextEngine(ContextCompressor):
             _DEFAULT_BASE_URL,
         )
         self.compresr_model = str(_opt("COMPRESR_MODEL", "model", _DEFAULT_MODEL))
-        self.compresr_timeout = _as_int(
-            _opt("COMPRESR_TIMEOUT", "timeout", _DEFAULT_TIMEOUT), _DEFAULT_TIMEOUT
+        self.compresr_timeout = max(
+            1, _as_int(_opt("COMPRESR_TIMEOUT", "timeout", _DEFAULT_TIMEOUT), _DEFAULT_TIMEOUT)
         )
         self.compresr_coarse = str(_opt("COMPRESR_COARSE", "coarse", "")).lower() in (
             "1", "true", "yes",
@@ -362,8 +389,13 @@ class CompresrContextEngine(ContextCompressor):
             except Exception:
                 pass
             raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"connection error: {e.reason}") from e
 
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"non-JSON response ({e}); body prefix: {raw[:200]!r}") from e
         if not parsed.get("success", False):
             raise RuntimeError(
                 f"API error: {parsed.get('message') or parsed.get('error')}"

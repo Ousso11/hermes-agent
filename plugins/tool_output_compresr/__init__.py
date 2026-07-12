@@ -64,7 +64,7 @@ _DEFAULT_MAX_CACHE_MB = 256
 _DEFAULT_TARGET_RATIO = 2.0
 _COOLDOWN_SECONDS = 30.0                # back-off after an API error before retrying
 _MAX_QUERY_CHARS = 600                  # cap on the derived query sent to the API
-_CACHE_ID_LEN = 16                      # hex chars of the content hash used as cache id
+_CACHE_ID_LEN = 32                      # hex chars of the content hash used as cache id (128 bits)
 _OK_STATUSES = ("", "ok", "success")    # statuses we compress; others pass through
 _FALLBACK_QUERY = (
     "Preserve the facts, paths, identifiers, errors, and results in this tool "
@@ -75,17 +75,42 @@ _QUERY_ARG_KEYS = ("query", "pattern", "command", "q", "search", "regex", "url")
 _PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
 
 
+_BLOCKED_METADATA_HOSTS = frozenset({
+    "169.254.169.254",
+    "fd00:ec2::254",
+    "100.100.100.200",
+    "168.63.129.16",
+    "metadata.google.internal",
+    "metadata.goog",
+})
+
+
 def _secure_base_url(url: str, default: str) -> str:
-    """Reject a non-HTTPS base_url (except localhost) so a stray config/env value
-    can't silently downgrade egress to cleartext or redirect the API key to an
-    attacker-controlled host. Falls back to *default* with a warning."""
+    """Reject a non-HTTPS base_url (except localhost) and cloud-metadata hosts so
+    a stray config/env value can't downgrade egress to cleartext or exfiltrate
+    the API key to IMDS. Falls back to *default* with a warning."""
+    import ipaddress
     from urllib.parse import urlparse
 
     try:
         parsed = urlparse(url)
     except Exception:
         parsed = None
-    host = (parsed.hostname or "") if parsed else ""
+    host = (parsed.hostname or "").lower() if parsed else ""
+
+    def _is_metadata_host() -> bool:
+        if host in _BLOCKED_METADATA_HOSTS:
+            return True
+        try:
+            return str(ipaddress.ip_address(host)) in _BLOCKED_METADATA_HOSTS
+        except ValueError:
+            return False
+
+    if parsed and _is_metadata_host():
+        logger.warning(
+            "tool_output_compresr: refusing base_url %r (cloud-metadata host); using %s", url, default,
+        )
+        return default
     if parsed and parsed.scheme == "https":
         return url
     if parsed and parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
@@ -223,9 +248,12 @@ class ToolOutputCompressor:
             _opt("COMPRESR_TOOL_OUTPUT_MIN_TOKENS", "tool_output_min_tokens", _DEFAULT_MIN_TOKENS),
             _DEFAULT_MIN_TOKENS,
         )
-        self.timeout = _as_int(
-            _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT),
-            _DEFAULT_TIMEOUT,
+        self.timeout = max(
+            1,
+            _as_int(
+                _opt("COMPRESR_TOOL_OUTPUT_TIMEOUT", "tool_output_timeout", _DEFAULT_TIMEOUT),
+                _DEFAULT_TIMEOUT,
+            ),
         )
         self.max_cache_mb = _as_int(
             _opt(

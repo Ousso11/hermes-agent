@@ -2754,6 +2754,9 @@ def _setup_context_compression(config: dict):
         if not api_key:
             print_warning("No API key provided. Leaving the built-in compressor in place.")
             return
+        if not api_key.startswith("cmp_"):
+            print_error("Invalid format: Compresr API keys start with 'cmp_'.")
+            return
         save_env_value("COMPRESR_API_KEY", api_key)
         print_success("Compresr API key saved")
 

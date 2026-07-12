@@ -17,6 +17,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.context_compressor import ContextCompressor  # noqa: E402
@@ -229,6 +231,43 @@ def test_update_model_parity_for_large_contexts():
         assert e.threshold_tokens < ctx
         assert e.tail_token_budget == parent.tail_token_budget
         assert e.max_summary_tokens == parent.max_summary_tokens
+
+
+def test_secure_base_url_rejects_cloud_metadata_ip():
+    # Regression: a misconfigured base_url pointing at IMDS would leak the
+    # API key to the metadata endpoint. Reject cloud-metadata hosts.
+    from plugins.context_engine.compresr import _secure_base_url
+
+    default = "https://api.compresr.ai"
+    assert _secure_base_url("https://169.254.169.254/latest/", default) == default
+    assert _secure_base_url("https://metadata.google.internal/", default) == default
+    assert _secure_base_url("https://100.100.100.200/", default) == default
+
+
+def test_secure_base_url_allows_valid_https():
+    from plugins.context_engine.compresr import _secure_base_url
+
+    default = "https://api.compresr.ai"
+    assert _secure_base_url("https://compresr.internal", default) == "https://compresr.internal"
+    assert _secure_base_url("http://localhost:8000", default) == "http://localhost:8000"
+
+
+def test_url_error_routed_through_runtime_error(monkeypatch):
+    # Regression: urllib.error.URLError (DNS failure, connect refused,
+    # socket.timeout) is NOT a subclass of HTTPError; it slipped past the
+    # except HTTPError and surfaced as an opaque exception. Must be caught.
+    import urllib.error
+    import urllib.request as ureq
+
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test")
+    e = CompresrContextEngine()
+
+    def _boom(*_a, **_kw):
+        raise urllib.error.URLError("Name or service not known")
+
+    monkeypatch.setattr(ureq, "urlopen", _boom)
+    with pytest.raises(RuntimeError, match="connection error"):
+        e._call_compresr("q", "ctx")
 
 
 def test_compresr_config_metadata_registered():

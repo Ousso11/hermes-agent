@@ -85,8 +85,13 @@ class CompresrToolOutputClient:
             except Exception:
                 pass
             raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"connection error: {e.reason}") from e
 
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"non-JSON response ({e}); body prefix: {raw[:200]!r}") from e
         if not parsed.get("success", False):
             raise RuntimeError(f"API error: {parsed.get('message') or parsed.get('error')}")
         d = parsed.get("data") or {}
